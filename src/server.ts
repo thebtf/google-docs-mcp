@@ -265,25 +265,47 @@ description: 'Reads the content of a specific Google Document, optionally return
 parameters: DocumentIdParameter.extend({
 format: z.enum(['text', 'json', 'markdown']).optional().default('text')
 .describe("Output format: 'text' (plain text), 'json' (raw API structure, complex), 'markdown' (experimental conversion)."),
-maxLength: z.number().optional().describe('Maximum character limit for text output. If not specified, returns full document content. Use this to limit very large documents.')
+maxLength: z.number().optional().describe('Maximum character limit for text output. If not specified, returns full document content. Use this to limit very large documents.'),
+tabId: z.string().optional().describe('The ID of the specific tab to read. If not specified, reads the first tab (or legacy document.body for documents without tabs).')
 }),
 execute: async (args, { log }) => {
 const docs = await getDocsClient();
-log.info(`Reading Google Doc: ${args.documentId}, Format: ${args.format}`);
+log.info(`Reading Google Doc: ${args.documentId}, Format: ${args.format}${args.tabId ? `, Tab: ${args.tabId}` : ''}`);
 
     try {
+        // Determine if we need tabs content
+        const needsTabsContent = !!args.tabId;
+
         const fields = args.format === 'json' || args.format === 'markdown'
             ? '*' // Get everything for structure analysis
             : 'body(content(paragraph(elements(textRun(content)))))'; // Just text content
 
         const res = await docs.documents.get({
             documentId: args.documentId,
-            fields: fields,
+            includeTabsContent: needsTabsContent,
+            fields: needsTabsContent ? '*' : fields, // Get full document if using tabs
         });
-        log.info(`Fetched doc: ${args.documentId}`);
+        log.info(`Fetched doc: ${args.documentId}${args.tabId ? ` (tab: ${args.tabId})` : ''}`);
+
+        // If tabId is specified, find the specific tab
+        let contentSource: any;
+        if (args.tabId) {
+            const targetTab = GDocsHelpers.findTabById(res.data, args.tabId);
+            if (!targetTab) {
+                throw new UserError(`Tab with ID "${args.tabId}" not found in document.`);
+            }
+            if (!targetTab.documentTab) {
+                throw new UserError(`Tab "${args.tabId}" does not have content (may not be a document tab).`);
+            }
+            contentSource = { body: targetTab.documentTab.body };
+            log.info(`Using content from tab: ${targetTab.tabProperties?.title || 'Untitled'}`);
+        } else {
+            // Use the document body (backward compatible)
+            contentSource = res.data;
+        }
 
         if (args.format === 'json') {
-            const jsonContent = JSON.stringify(res.data, null, 2);
+            const jsonContent = JSON.stringify(contentSource, null, 2);
             // Apply length limit to JSON if specified
             if (args.maxLength && jsonContent.length > args.maxLength) {
                 return jsonContent.substring(0, args.maxLength) + `\n... [JSON truncated: ${jsonContent.length} total chars]`;
@@ -292,7 +314,7 @@ log.info(`Reading Google Doc: ${args.documentId}, Format: ${args.format}`);
         }
 
         if (args.format === 'markdown') {
-            const markdownContent = convertDocsJsonToMarkdown(res.data);
+            const markdownContent = convertDocsJsonToMarkdown(contentSource);
             const totalLength = markdownContent.length;
             log.info(`Generated markdown: ${totalLength} characters`);
 
@@ -309,13 +331,13 @@ log.info(`Reading Google Doc: ${args.documentId}, Format: ${args.format}`);
         let textContent = '';
         let elementCount = 0;
 
-        // Process all content elements
-        res.data.body?.content?.forEach(element => {
+        // Process all content elements from contentSource
+        contentSource.body?.content?.forEach((element: any) => {
             elementCount++;
 
             // Handle paragraphs
             if (element.paragraph?.elements) {
-                element.paragraph.elements.forEach(pe => {
+                element.paragraph.elements.forEach((pe: any) => {
                     if (pe.textRun?.content) {
                         textContent += pe.textRun.content;
                     }
@@ -324,10 +346,10 @@ log.info(`Reading Google Doc: ${args.documentId}, Format: ${args.format}`);
 
             // Handle tables
             if (element.table?.tableRows) {
-                element.table.tableRows.forEach(row => {
-                    row.tableCells?.forEach(cell => {
-                        cell.content?.forEach(cellElement => {
-                            cellElement.paragraph?.elements?.forEach(pe => {
+                element.table.tableRows.forEach((row: any) => {
+                    row.tableCells?.forEach((cell: any) => {
+                        cell.content?.forEach((cellElement: any) => {
+                            cellElement.paragraph?.elements?.forEach((pe: any) => {
                                 if (pe.textRun?.content) {
                                     textContent += pe.textRun.content;
                                 }

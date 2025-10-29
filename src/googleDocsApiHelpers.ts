@@ -654,3 +654,32 @@ export function getTabTextLength(documentTab: any): number {
 
     return totalLength;
 }
+
+/**
+ * Find a specific tab by ID in a document (searches recursively through child tabs)
+ * @param doc - The Google Doc document object
+ * @param tabId - The tab ID to search for
+ * @returns The tab object if found, null otherwise
+ */
+export function findTabById(doc: docs_v1.Schema$Document, tabId: string): any {
+    if (!doc.tabs || doc.tabs.length === 0) {
+        return null;
+    }
+
+    // Helper function to search through tabs recursively
+    const searchTabs = (tabs: any[]): any => {
+        for (const tab of tabs) {
+            if (tab.tabProperties?.tabId === tabId) {
+                return tab;
+            }
+            // Recursively search child tabs
+            if (tab.childTabs && tab.childTabs.length > 0) {
+                const found = searchTabs(tab.childTabs);
+                if (found) return found;
+            }
+        }
+        return null;
+    };
+
+    return searchTabs(doc.tabs);
+}
