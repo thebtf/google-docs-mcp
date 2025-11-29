@@ -343,6 +343,27 @@ All tab-related features have been validated with real Google Docs containing mu
 - Correct content retrieval and manipulation per tab
 - Full backward compatibility with single-tab and legacy documents
 
+## Known Limitations
+
+While this MCP server provides comprehensive Google Docs and Drive functionality, there are some limitations imposed by the Google APIs themselves:
+
+### Comment Anchoring
+
+**Programmatically Created Comments Are Not Anchored**: Comments created via the `addComment` tool appear in the "All Comments" list but are not visibly anchored to specific text in the Google Docs UI. They will show "original content deleted" instead of highlighting the intended text range. This is a limitation of the Google Drive API v3 when working with Google Docs files.
+
+- **Workaround**: Comments created manually in the Google Docs UI are properly anchored
+- **Other Operations**: Reply, delete, and list operations work correctly on all comments regardless of how they were created
+
+### Comment Resolution
+
+**Resolved Status May Not Persist**: The `resolveComment` tool attempts to mark comments as resolved, but the Drive API v3 does not fully support this operation for Google Docs files. The resolved status may not persist or be visible in the Google Docs UI.
+
+- **Workaround**: Resolve comments manually in the Google Docs web interface
+
+### Converted Documents
+
+**Limited Support for Converted Documents**: Some Google Docs that were converted from other formats (especially Microsoft Word documents) may not support all Docs API operations. You may encounter errors like "This operation is not supported for this document" when trying to read or modify these files.
+
 ## Troubleshooting
 
 - **Claude shows "Failed" or "Could not attach":**

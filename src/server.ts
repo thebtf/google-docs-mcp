@@ -382,13 +382,17 @@ log.info(`Reading Google Doc: ${args.documentId}, Format: ${args.format}${args.t
 
     } catch (error: any) {
          log.error(`Error reading doc ${args.documentId}: ${error.message || error}`);
+         log.error(`Error details: ${JSON.stringify(error.response?.data || error)}`);
          // Handle errors thrown by helpers or API directly
          if (error instanceof UserError) throw error;
          if (error instanceof NotImplementedError) throw error;
          // Generic fallback for API errors not caught by helpers
           if (error.code === 404) throw new UserError(`Doc not found (ID: ${args.documentId}).`);
           if (error.code === 403) throw new UserError(`Permission denied for doc (ID: ${args.documentId}).`);
-         throw new UserError(`Failed to read doc: ${error.message || 'Unknown error'}`);
+         // Extract detailed error information from Google API response
+         const errorDetails = error.response?.data?.error?.message || error.message || 'Unknown error';
+         const errorCode = error.response?.data?.error?.code || error.code;
+         throw new UserError(`Failed to read doc: ${errorDetails}${errorCode ? ` (Code: ${errorCode})` : ''}`);
     }
 
 },
@@ -1134,7 +1138,7 @@ server.addTool({
 
 server.addTool({
   name: 'addComment',
-  description: 'Adds a comment anchored to a specific text range in the document.',
+  description: 'Adds a comment anchored to a specific text range in the document. NOTE: Due to Google API limitations, comments created programmatically appear in the "All Comments" list but are not visibly anchored to text in the document UI (they show "original content deleted"). However, replies, resolve, and delete operations work on all comments including manually-created ones.',
   parameters: DocumentIdParameter.extend({
     startIndex: z.number().int().min(1).describe('The starting index of the text range (inclusive, starts from 1).'),
     endIndex: z.number().int().min(1).describe('The ending index of the text range (exclusive).'),
@@ -1242,7 +1246,7 @@ server.addTool({
 
 server.addTool({
   name: 'resolveComment',
-  description: 'Marks a comment as resolved.',
+  description: 'Marks a comment as resolved. NOTE: Due to Google API limitations, the Drive API does not support resolving comments on Google Docs files. This operation will attempt to update the comment but the resolved status may not persist in the UI. Comments can be resolved manually in the Google Docs interface.',
   parameters: DocumentIdParameter.extend({
     commentId: z.string().describe('The ID of the comment to resolve')
   }),
