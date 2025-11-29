@@ -1566,7 +1566,9 @@ log.info(`Getting info for document: ${args.documentId}`);
 try {
   const response = await drive.files.get({
     fileId: args.documentId,
-    fields: 'id,name,description,mimeType,size,createdTime,modifiedTime,webViewLink,alternateLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),shared,permissions(role,type,emailAddress),parents,version',
+    // Note: 'permissions' and 'alternateLink' fields removed - they cause
+    // "Invalid field selection" errors for Google Docs files
+    fields: 'id,name,description,mimeType,size,createdTime,modifiedTime,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),shared,parents,version',
   });
 
   const file = response.data;

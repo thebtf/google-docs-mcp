@@ -77,7 +77,7 @@ linkUrl: z.string().url().optional().describe('Make the text a hyperlink pointin
 export type TextStyleArgs = z.infer<typeof TextStyleParameters>;
 
 export const ParagraphStyleParameters = z.object({
-alignment: z.enum(['LEFT', 'CENTER', 'RIGHT', 'JUSTIFIED']).optional().describe('Paragraph alignment.'),
+alignment: z.enum(['START', 'END', 'CENTER', 'JUSTIFIED']).optional().describe('Paragraph alignment. START=left for LTR languages, END=right for LTR languages.'),
 indentStart: z.number().min(0).optional().describe('Left indentation in points.'),
 indentEnd: z.number().min(0).optional().describe('Right indentation in points.'),
 spaceAbove: z.number().min(0).optional().describe('Space before the paragraph in points.'),
@@ -113,9 +113,7 @@ export const ApplyParagraphStyleToolParameters = DocumentIdParameter.extend({
 // Target EITHER by range OR by finding text (tool logic needs to find paragraph boundaries)
 target: z.union([
 RangeParameters, // User provides paragraph start/end (less likely)
-TextFindParameter.extend({
-applyToContainingParagraph: z.literal(true).default(true).describe("Must be true. Indicates the style applies to the whole paragraph containing the found text.")
-}),
+TextFindParameter, // Find text within paragraph to apply style
 z.object({ // Target by specific index within the paragraph
 indexWithinParagraph: z.number().int().min(1).describe("An index located anywhere within the target paragraph.")
 })
