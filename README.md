@@ -1,13 +1,14 @@
-# Ultimate Google Docs & Drive MCP Server
+# Ultimate Google Docs, Sheets & Drive MCP Server
 
 ![Demo Animation](assets/google.docs.mcp.1.gif)
 
-Connect Claude Desktop (or other MCP clients) to your Google Docs and Google Drive!
+Connect Claude Desktop (or other MCP clients) to your Google Docs, Google Sheets, and Google Drive!
 
 > 🔥 **Check out [15 powerful tasks](SAMPLE_TASKS.md) you can accomplish with this enhanced server!**
 > 📁 **NEW:** Complete Google Drive file management capabilities!
+> 📊 **NEW:** Full Google Sheets support for reading, writing, and managing spreadsheets!
 
-This comprehensive server uses the Model Context Protocol (MCP) and the `fastmcp` library to provide tools for reading, writing, formatting, structuring Google Documents, and managing your entire Google Drive. It acts as a powerful bridge, allowing AI assistants like Claude to interact with your documents and files programmatically with advanced capabilities.
+This comprehensive server uses the Model Context Protocol (MCP) and the `fastmcp` library to provide tools for reading, writing, formatting, structuring Google Documents and Spreadsheets, and managing your entire Google Drive. It acts as a powerful bridge, allowing AI assistants like Claude to interact with your documents, spreadsheets, and files programmatically with advanced capabilities.
 
 **Features:**
 
@@ -41,6 +42,17 @@ This comprehensive server uses the Model Context Protocol (MCP) and the `fastmcp
 - **Resolve Comments:** Mark comments as resolved with `resolveComment`
 - **Delete Comments:** Remove comments from documents with `deleteComment`
 
+### 🆕 Google Sheets Support
+
+- **Read Spreadsheets:** Read data from ranges with `readSpreadsheet` (supports A1 notation like "A1:B10" or "Sheet1!A1:B10")
+- **Write Data:** Write data to ranges with `writeSpreadsheet` (overwrites existing data)
+- **Append Rows:** Add new rows to sheets with `appendSpreadsheetRows`
+- **Clear Ranges:** Clear cell values with `clearSpreadsheetRange`
+- **Spreadsheet Info:** Get detailed metadata and sheet list with `getSpreadsheetInfo`
+- **Create Spreadsheets:** Create new spreadsheets with `createSpreadsheet` (optionally with initial data)
+- **Add Sheets:** Add new sheets/tabs to spreadsheets with `addSpreadsheetSheet`
+- **List Spreadsheets:** Find and list spreadsheets with `listGoogleSheets`
+
 ### 🆕 Google Drive File Management
 
 - **Document Discovery:** Find and list documents with `listGoogleDocs`, `searchGoogleDocs`, `getRecentGoogleDocs`
@@ -51,7 +63,7 @@ This comprehensive server uses the Model Context Protocol (MCP) and the `fastmcp
 
 ### Integration
 
-- **Google Authentication:** Secure OAuth 2.0 authentication with full Drive access
+- **Google Authentication:** Secure OAuth 2.0 authentication with full Drive, Docs, and Sheets access
 - **MCP Compliant:** Designed for use with Claude and other MCP clients
 - **VS Code Integration:** [Setup guide](vscode.md) for VS Code MCP extension
 
@@ -84,6 +96,7 @@ This server needs permission to talk to Google APIs on your behalf. You'll creat
 3.  **Enable APIs:** You need to turn on the specific Google services this server uses.
     - In the search bar at the top, type "APIs & Services" and select "Library".
     - Search for "**Google Docs API**" and click on it. Then click the "**ENABLE**" button.
+    - Search for "**Google Sheets API**" and click on it. Then click the "**ENABLE**" button.
     - Search for "**Google Drive API**" and click on it. Then click the "**ENABLE**" button (this is often needed for finding files or permissions).
 4.  **Configure OAuth Consent Screen:** This screen tells users (usually just you) what your app wants permission for.
     - On the left menu, click "APIs & Services" -> "**OAuth consent screen**".
@@ -95,6 +108,7 @@ This server needs permission to talk to Google APIs on your behalf. You'll creat
     - Click "**SAVE AND CONTINUE**".
     - **Scopes:** Click "**ADD OR REMOVE SCOPES**". Search for and add the following scopes:
       - `https://www.googleapis.com/auth/documents` (Allows reading/writing docs)
+      - `https://www.googleapis.com/auth/spreadsheets` (Allows reading/writing spreadsheets)
       - `https://www.googleapis.com/auth/drive.file` (Allows access to specific files opened/created by the app)
       - Click "**UPDATE**".
     - Click "**SAVE AND CONTINUE**".
@@ -158,7 +172,7 @@ Now you need to run the server once manually to grant it permission to access yo
     - Copy the entire long URL from the terminal.
     - Paste the URL into your web browser and press Enter.
     - Log in with the **same Google account** you added as a Test User in Step 1.4.
-    - Google will show a screen asking for permission for your app ("Claude Docs MCP Access" or similar) to access Google Docs/Drive. Review and click "**Allow**" or "**Grant**".
+      - Google will show a screen asking for permission for your app ("Claude Docs MCP Access" or similar) to access Google Docs, Sheets, and Drive. Review and click "**Allow**" or "**Grant**".
 4.  **Get the Authorization Code:**
     - After clicking Allow, your browser will likely try to redirect to `http://localhost` and show a **"This site can't be reached" error**. **THIS IS NORMAL!**
     - Look **carefully** at the URL in your browser's address bar. It will look like `http://localhost/?code=4/0Axxxxxxxxxxxxxx&scope=...`
@@ -250,6 +264,7 @@ When `tabId` is not specified, operations target the first tab (or the legacy do
 
 ### Advanced Usage Examples:
 
+**Google Docs:**
 - **Text Styling**: "Use `applyTextStyle` to make the text 'Important Section' bold and red (#FF0000) in document `YOUR_GOOGLE_DOC_ID`."
 - **Paragraph Styling**: "Use `applyParagraphStyle` to center-align the paragraph containing 'Title Here' in document `YOUR_GOOGLE_DOC_ID`."
 - **Table Creation**: "Insert a 3x4 table at index 500 in document `YOUR_GOOGLE_DOC_ID` using the `insertTable` tool."
@@ -257,7 +272,19 @@ When `tabId` is not specified, operations target the first tab (or the legacy do
 - **Local Image Upload**: "Use `insertLocalImage` to upload '/path/to/image.jpg' and insert it at index 200 in document `YOUR_GOOGLE_DOC_ID`."
 - **Legacy Formatting**: "Use `formatMatchingText` to find the second instance of 'Project Alpha' and make it blue (#0000FF) in doc `YOUR_GOOGLE_DOC_ID`."
 
-Remember to replace `YOUR_GOOGLE_DOC_ID` with the actual ID from a Google Doc's URL (the long string between `/d/` and `/edit`).
+**Google Sheets:**
+- **Read Data**: "Read range A1:B10 from spreadsheet `YOUR_SPREADSHEET_ID` using `readSpreadsheet`."
+- **Write Data**: "Write data [[1, 2], [3, 4]] to range A1:B2 in spreadsheet `YOUR_SPREADSHEET_ID`."
+- **Append Rows**: "Append rows [[5, 6], [7, 8]] to spreadsheet `YOUR_SPREADSHEET_ID` starting at A1."
+- **Create Spreadsheet**: "Create a new spreadsheet titled 'Sales Data' with initial data [[Name, Amount], [Product A, 100]]."
+- **Get Info**: "Get information about spreadsheet `YOUR_SPREADSHEET_ID` including all sheets."
+- **Add Sheet**: "Add a new sheet named 'Summary' to spreadsheet `YOUR_SPREADSHEET_ID`."
+- **Clear Range**: "Clear the range A1:B10 in spreadsheet `YOUR_SPREADSHEET_ID`."
+- **List Spreadsheets**: "List all my Google Spreadsheets modified in the last 30 days."
+
+Remember to replace:
+- `YOUR_GOOGLE_DOC_ID` with the actual ID from a Google Doc's URL (the long string between `/d/` and `/edit`)
+- `YOUR_SPREADSHEET_ID` with the actual ID from a Google Sheet's URL (the long string between `/d/` and `/edit`)
 
 Claude will automatically launch your server in the background when needed using the command you provided. You do **not** need to run `node ./dist/server.js` manually anymore.
 
@@ -343,9 +370,45 @@ All tab-related features have been validated with real Google Docs containing mu
 - Correct content retrieval and manipulation per tab
 - Full backward compatibility with single-tab and legacy documents
 
+## Google Sheets Usage
+
+### A1 Notation
+
+Google Sheets uses A1 notation to specify ranges. Examples:
+- `A1` - Single cell
+- `A1:B10` - Range from A1 to B10
+- `Sheet1!A1:B10` - Range on a specific sheet named "Sheet1"
+- `A:A` - Entire column A
+- `1:1` - Entire row 1
+
+### Value Input Options
+
+When writing data to spreadsheets, you can choose how values are interpreted:
+- **USER_ENTERED** (default): Values are parsed as if typed by a user (formulas work, dates are recognized, etc.)
+- **RAW**: Values are stored exactly as provided (no parsing)
+
+### Example Workflow
+
+```bash
+# 1. Create a new spreadsheet
+"Create a spreadsheet titled 'Monthly Report'"
+
+# 2. Write headers
+"Write [[Date, Sales, Expenses]] to range A1:C1 in spreadsheet YOUR_SPREADSHEET_ID"
+
+# 3. Append data rows
+"Append rows [[2024-01-01, 1000, 500], [2024-01-02, 1200, 600]] to spreadsheet YOUR_SPREADSHEET_ID starting at A2"
+
+# 4. Read the data back
+"Read range A1:C3 from spreadsheet YOUR_SPREADSHEET_ID"
+
+# 5. Add a new sheet for analysis
+"Add a new sheet named 'Analysis' to spreadsheet YOUR_SPREADSHEET_ID"
+```
+
 ## Known Limitations
 
-While this MCP server provides comprehensive Google Docs and Drive functionality, there are some limitations imposed by the Google APIs themselves:
+While this MCP server provides comprehensive Google Docs, Sheets, and Drive functionality, there are some limitations imposed by the Google APIs themselves:
 
 ### Comment Anchoring
 
@@ -373,9 +436,10 @@ While this MCP server provides comprehensive Google Docs and Drive functionality
   - Check the Claude Desktop logs (see the official MCP debugging guide).
   - Make sure all `console.log` status messages in the server code were changed to `console.error`.
 - **Google Authorization Errors:**
-  - Ensure you enabled the correct APIs (Docs, Drive).
+  - Ensure you enabled the correct APIs (Docs, Sheets, Drive).
   - Make sure you added your email as a Test User on the OAuth Consent Screen.
   - Verify the `credentials.json` file is correctly placed in the project root.
+  - **If you're upgrading from an older version:** You may need to delete your existing `token.json` file and re-authenticate to grant the new Sheets API scope.
 - **Tab-related Errors:**
   - If you get "Tab with ID not found", use `listDocumentTabs` to see all available tab IDs
   - Ensure you're using the correct tab ID format (typically a short alphanumeric string)
