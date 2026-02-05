@@ -22,6 +22,7 @@ MarkdownConversionError
 } from './types.js';
 import * as GDocsHelpers from './googleDocsApiHelpers.js';
 import * as SheetsHelpers from './googleSheetsApiHelpers.js';
+import * as TableHelpers from './tableHelpers.js';
 import { convertMarkdownToRequests } from './markdownToGoogleDocs.js';
 
 let authClient: OAuth2Client | null = null;
@@ -83,7 +84,7 @@ process.on('unhandledRejection', (reason, promise) => {
 
 const server = new FastMCP({
   name: 'Ultimate Google Docs & Sheets MCP Server',
-  version: '1.0.0'
+  version: '1.1.0'
 });
 
 // --- Helper to get Docs client within tools ---
@@ -1041,37 +1042,217 @@ throw new UserError(`Failed to insert table: ${error.message || 'Unknown error'}
 }
 });
 
+// === TABLE EDITING TOOLS ===
+
 server.addTool({
-name: 'editTableCell',
-description: 'Edits the content and/or basic style of a specific table cell. Requires knowing table start index.',
+name: 'getTableStructure',
+description: 'Returns structure of all tables in a Google Document: dimensions, header row text, start/end indices. Use this first to understand the document layout before editing cells.',
+parameters: DocumentIdParameter,
+execute: async (args, { log }) => {
+  const docs = await getDocsClient();
+  log.info(`Getting table structure for doc ${args.documentId}`);
+  try {
+    const res = await docs.documents.get({ documentId: args.documentId });
+    if (!res.data.body?.content) {
+      return 'Document has no content.';
+    }
+    const tables = TableHelpers.getTablesInfo(res.data.body.content);
+    if (tables.length === 0) {
+      return 'No tables found in this document.';
+    }
+    return JSON.stringify(tables, null, 2);
+  } catch (error: any) {
+    log.error(`Error getting table structure: ${error.message || error}`);
+    if (error instanceof UserError) throw error;
+    if (error.code === 404) throw new UserError(`Document not found (ID: ${args.documentId}).`);
+    if (error.code === 403) throw new UserError(`Permission denied for document (ID: ${args.documentId}).`);
+    throw new UserError(`Failed to get table structure: ${error.message || 'Unknown error'}`);
+  }
+}
+});
+
+server.addTool({
+name: 'readTableCells',
+description: 'Reads all cell values and metadata from a specific table. Returns a 2D array of values and metadata (text, hasImage, startIndex, endIndex, colSpan). Use tableIndex from getTableStructure.',
 parameters: DocumentIdParameter.extend({
-tableStartIndex: z.number().int().min(1).describe("The starting index of the TABLE element itself (tricky to find, may require reading structure first)."),
-rowIndex: z.number().int().min(0).describe("Row index (0-based)."),
-columnIndex: z.number().int().min(0).describe("Column index (0-based)."),
-textContent: z.string().optional().describe("Optional: New text content for the cell. Replaces existing content."),
-// Combine basic styles for simplicity here. More advanced cell styling might need separate tools.
-textStyle: TextStyleParameters.optional().describe("Optional: Text styles to apply."),
-paragraphStyle: ParagraphStyleParameters.optional().describe("Optional: Paragraph styles (like alignment) to apply."),
-// cellBackgroundColor: z.string().optional()... // Cell-specific styles are complex
+  tableIndex: z.number().int().min(0).describe('The table index (0-based). Use getTableStructure to find the correct index.'),
 }),
 execute: async (args, { log }) => {
-const docs = await getDocsClient();
-log.info(`Editing cell (${args.rowIndex}, ${args.columnIndex}) in table starting at ${args.tableStartIndex}, doc ${args.documentId}`);
+  const docs = await getDocsClient();
+  log.info(`Reading cells from table ${args.tableIndex} in doc ${args.documentId}`);
+  try {
+    const res = await docs.documents.get({ documentId: args.documentId });
+    if (!res.data.body?.content) {
+      throw new UserError('Document has no content.');
+    }
+    const result = TableHelpers.readTableCells(res.data.body.content, args.tableIndex);
+    return JSON.stringify(result, null, 2);
+  } catch (error: any) {
+    log.error(`Error reading table cells: ${error.message || error}`);
+    if (error instanceof UserError) throw error;
+    if (error.code === 404) throw new UserError(`Document not found (ID: ${args.documentId}).`);
+    throw new UserError(`Failed to read table cells: ${error.message || 'Unknown error'}`);
+  }
+}
+});
 
-        // TODO: Implement complex logic
-        // 1. Find the cell's content range based on tableStartIndex, rowIndex, columnIndex. This is NON-TRIVIAL.
-        //    Requires getting the document, finding the table element, iterating through rows/cells to calculate indices.
-        // 2. If textContent is provided, generate a DeleteContentRange request for the cell's current content.
-        // 3. Generate an InsertText request for the new textContent at the cell's start index.
-        // 4. If textStyle is provided, generate UpdateTextStyle requests for the new text range.
-        // 5. If paragraphStyle is provided, generate UpdateParagraphStyle requests for the cell's paragraph range.
-        // 6. Execute batch update.
-
-        log.error("editTableCell is not implemented due to complexity of finding cell indices.");
-        throw new NotImplementedError("Editing table cells is complex and not yet implemented.");
-        // return `Edit request for cell (${args.rowIndex}, ${args.columnIndex}) submitted (Not Implemented).`;
+server.addTool({
+name: 'editTableCell',
+description: 'Replaces the text content of a specific table cell. Preserves inline images in the cell — only text is replaced. Use getTableStructure and readTableCells first to find the correct table/row/column indices.',
+parameters: DocumentIdParameter.extend({
+  tableIndex: z.number().int().min(0).describe('The table index (0-based). Use getTableStructure to find the correct index.'),
+  rowIndex: z.number().int().min(0).describe('Row index (0-based).'),
+  columnIndex: z.number().int().min(0).describe('Column index (0-based).'),
+  newText: z.string().describe('New text content for the cell. Replaces existing text but preserves images.'),
+}),
+execute: async (args, { log }) => {
+  const docs = await getDocsClient();
+  log.info(`Editing cell (${args.rowIndex}, ${args.columnIndex}) in table ${args.tableIndex}, doc ${args.documentId}`);
+  try {
+    // Fetch current document state to calculate correct indices
+    const res = await docs.documents.get({ documentId: args.documentId });
+    if (!res.data.body?.content) {
+      throw new UserError('Document has no content.');
     }
 
+    const requests = TableHelpers.buildEditCellRequests(
+      res.data.body.content,
+      args.tableIndex,
+      args.rowIndex,
+      args.columnIndex,
+      args.newText,
+    );
+
+    if (requests.length === 0) {
+      return 'No changes needed — cell already matches the desired content.';
+    }
+
+    await GDocsHelpers.executeBatchUpdate(docs, args.documentId, requests);
+    return `Successfully updated cell (${args.rowIndex}, ${args.columnIndex}) in table ${args.tableIndex} with text: "${args.newText.substring(0, 100)}${args.newText.length > 100 ? '...' : ''}"`;
+  } catch (error: any) {
+    log.error(`Error editing table cell: ${error.message || error}`);
+    if (error instanceof UserError) throw error;
+    if (error.code === 404) throw new UserError(`Document not found (ID: ${args.documentId}).`);
+    throw new UserError(`Failed to edit table cell: ${error.message || 'Unknown error'}`);
+  }
+}
+});
+
+server.addTool({
+name: 'insertImageInTableCell',
+description: 'Inserts an inline image from a public URL into a specific table cell. The image is inserted at the beginning of the cell, before any existing content.',
+parameters: DocumentIdParameter.extend({
+  tableIndex: z.number().int().min(0).describe('The table index (0-based).'),
+  rowIndex: z.number().int().min(0).describe('Row index (0-based).'),
+  columnIndex: z.number().int().min(0).describe('Column index (0-based).'),
+  imageUrl: z.string().url().describe('Publicly accessible URL to the image (must be http:// or https://).'),
+  width: z.number().min(1).optional().describe('Optional: Width of the image in points.'),
+  height: z.number().min(1).optional().describe('Optional: Height of the image in points.'),
+}),
+execute: async (args, { log }) => {
+  const docs = await getDocsClient();
+  log.info(`Inserting image into cell (${args.rowIndex}, ${args.columnIndex}) in table ${args.tableIndex}, doc ${args.documentId}`);
+  try {
+    const res = await docs.documents.get({ documentId: args.documentId });
+    if (!res.data.body?.content) {
+      throw new UserError('Document has no content.');
+    }
+
+    const request = TableHelpers.buildInsertImageInCellRequest(
+      res.data.body.content,
+      args.tableIndex,
+      args.rowIndex,
+      args.columnIndex,
+      args.imageUrl,
+      args.width,
+      args.height,
+    );
+
+    await GDocsHelpers.executeBatchUpdate(docs, args.documentId, [request]);
+    return `Successfully inserted image into cell (${args.rowIndex}, ${args.columnIndex}) in table ${args.tableIndex}.`;
+  } catch (error: any) {
+    log.error(`Error inserting image in table cell: ${error.message || error}`);
+    if (error instanceof UserError) throw error;
+    if (error.code === 404) throw new UserError(`Document not found (ID: ${args.documentId}).`);
+    throw new UserError(`Failed to insert image in table cell: ${error.message || 'Unknown error'}`);
+  }
+}
+});
+
+server.addTool({
+name: 'findTableRow',
+description: 'Finds rows in a table where a specific column contains the search text (partial match). Returns matching row indices and their full cell values. Useful for looking up entries in glossary/reference tables.',
+parameters: DocumentIdParameter.extend({
+  tableIndex: z.number().int().min(0).describe('The table index (0-based).'),
+  searchColumn: z.number().int().min(0).describe('Column index to search in (0-based).'),
+  searchText: z.string().min(1).describe('Text to search for (partial match).'),
+  caseSensitive: z.boolean().optional().default(false).describe('Whether the search should be case-sensitive. Defaults to false.'),
+}),
+execute: async (args, { log }) => {
+  const docs = await getDocsClient();
+  log.info(`Finding rows in table ${args.tableIndex} where column ${args.searchColumn} contains "${args.searchText}", doc ${args.documentId}`);
+  try {
+    const res = await docs.documents.get({ documentId: args.documentId });
+    if (!res.data.body?.content) {
+      throw new UserError('Document has no content.');
+    }
+
+    const results = TableHelpers.findTableRows(
+      res.data.body.content,
+      args.tableIndex,
+      args.searchColumn,
+      args.searchText,
+      args.caseSensitive,
+    );
+
+    if (results.length === 0) {
+      return `No rows found in table ${args.tableIndex} where column ${args.searchColumn} contains "${args.searchText}".`;
+    }
+
+    return JSON.stringify({
+      matches: results.length,
+      rows: results,
+    }, null, 2);
+  } catch (error: any) {
+    log.error(`Error finding table rows: ${error.message || error}`);
+    if (error instanceof UserError) throw error;
+    if (error.code === 404) throw new UserError(`Document not found (ID: ${args.documentId}).`);
+    throw new UserError(`Failed to find table rows: ${error.message || 'Unknown error'}`);
+  }
+}
+});
+
+server.addTool({
+name: 'addTableRow',
+description: 'Inserts a new empty row into a table after the specified row index.',
+parameters: DocumentIdParameter.extend({
+  tableIndex: z.number().int().min(0).describe('The table index (0-based).'),
+  insertBelowRow: z.number().int().min(0).describe('Row index after which to insert the new row (0-based). Use the last row index to append at the end.'),
+}),
+execute: async (args, { log }) => {
+  const docs = await getDocsClient();
+  log.info(`Adding row after row ${args.insertBelowRow} in table ${args.tableIndex}, doc ${args.documentId}`);
+  try {
+    const res = await docs.documents.get({ documentId: args.documentId });
+    if (!res.data.body?.content) {
+      throw new UserError('Document has no content.');
+    }
+
+    const request = TableHelpers.buildAddTableRowRequest(
+      res.data.body.content,
+      args.tableIndex,
+      args.insertBelowRow,
+    );
+
+    await GDocsHelpers.executeBatchUpdate(docs, args.documentId, [request]);
+    return `Successfully inserted a new row after row ${args.insertBelowRow} in table ${args.tableIndex}.`;
+  } catch (error: any) {
+    log.error(`Error adding table row: ${error.message || error}`);
+    if (error instanceof UserError) throw error;
+    if (error.code === 404) throw new UserError(`Document not found (ID: ${args.documentId}).`);
+    throw new UserError(`Failed to add table row: ${error.message || 'Unknown error'}`);
+  }
+}
 });
 
 server.addTool({
