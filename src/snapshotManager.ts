@@ -211,7 +211,9 @@ export async function restoreDocumentContent(
 async function getInsertionPoint(docs: docs_v1.Docs, documentId: string): Promise<number> {
   const doc = await docs.documents.get({ documentId });
   const body = doc.data.body?.content || [];
-  return body[body.length - 1].endIndex! - 1;
+  if (body.length === 0) return 1;
+  const endIndex = body[body.length - 1]?.endIndex;
+  return (endIndex != null && endIndex > 1) ? endIndex - 1 : 1;
 }
 
 /**
@@ -311,7 +313,7 @@ async function restoreParagraphBatch(
           insertInlineImage: {
             location: { index: img.index },
             uri: img.uri,
-            ...(img.width && img.height && {
+            ...(img.width != null && img.height != null && {
               objectSize: {
                 height: { magnitude: img.height, unit: 'PT' },
                 width: { magnitude: img.width, unit: 'PT' },
@@ -510,7 +512,19 @@ export async function undoLastChange(
 
   // Pop and restore from undo stack
   const snapshot = stack.undoStack.pop()!;
-  await restoreDocumentContent(docs, documentId, snapshot);
+  try {
+    await restoreDocumentContent(docs, documentId, snapshot);
+  } catch (error) {
+    // Restore failed — attempt to recover from saved state
+    try {
+      await restoreDocumentContent(docs, documentId, currentSnapshot);
+      stack.redoStack.pop(); // Remove the current snapshot we just pushed
+      stack.undoStack.push(snapshot); // Put it back
+    } catch {
+      // Recovery also failed — leave stacks as-is for manual intervention
+    }
+    throw new UserError(`Undo failed during restoration: ${error instanceof Error ? error.message : 'Unknown error'}. Attempted recovery to pre-undo state.`);
+  }
 
   return {
     restored: snapshot,
@@ -549,7 +563,19 @@ export async function redoLastChange(
 
   // Pop and restore from redo stack
   const snapshot = stack.redoStack.pop()!;
-  await restoreDocumentContent(docs, documentId, snapshot);
+  try {
+    await restoreDocumentContent(docs, documentId, snapshot);
+  } catch (error) {
+    // Restore failed — attempt to recover from saved state
+    try {
+      await restoreDocumentContent(docs, documentId, currentSnapshot);
+      stack.undoStack.pop(); // Remove the current snapshot we just pushed
+      stack.redoStack.push(snapshot); // Put it back
+    } catch {
+      // Recovery also failed — leave stacks as-is for manual intervention
+    }
+    throw new UserError(`Redo failed during restoration: ${error instanceof Error ? error.message : 'Unknown error'}. Attempted recovery to pre-redo state.`);
+  }
 
   return {
     restored: snapshot,
