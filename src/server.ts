@@ -23,7 +23,8 @@ MarkdownConversionError
 import * as GDocsHelpers from './googleDocsApiHelpers.js';
 import * as SheetsHelpers from './googleSheetsApiHelpers.js';
 import * as TableHelpers from './tableHelpers.js';
-import { convertMarkdownToRequests } from './markdownToGoogleDocs.js';
+import { convertMarkdownToRequests, convertMarkdownToRequestsWithTables, type PendingTableFill } from './markdownToGoogleDocs.js';
+import * as SnapshotManager from './snapshotManager.js';
 
 let authClient: OAuth2Client | null = null;
 let googleDocs: docs_v1.Docs | null = null;
@@ -682,6 +683,186 @@ try {
 }
 });
 
+// --- Markdown Table Fill Helper ---
+
+/**
+ * After markdown conversion creates tables (insertTable), this function
+ * re-reads the document to find the actual table indices and fills cells.
+ */
+async function fillPendingTables(
+  docs: docs_v1.Docs,
+  documentId: string,
+  pendingFills: PendingTableFill[],
+  tabId?: string,
+  log?: { info: (msg: string) => void }
+): Promise<void> {
+  // Re-read the document to get actual table positions
+  const res = await docs.documents.get({
+    documentId,
+    includeTabsContent: !!tabId,
+  });
+
+  let bodyContent = res.data.body?.content;
+  if (tabId) {
+    const tab = GDocsHelpers.findTabById(res.data, tabId);
+    bodyContent = tab?.documentTab?.body?.content;
+  }
+  if (!bodyContent) return;
+
+  const tables = TableHelpers.extractTableElements(bodyContent);
+
+  for (const fill of pendingFills) {
+    // Find the table that was inserted at/near fill.insertIndex
+    const tableEl = tables.find(t => {
+      const si = t.startIndex;
+      return si != null && si >= fill.insertIndex - 1 && si <= fill.insertIndex + fill.rows * fill.columns * 3;
+    });
+
+    if (!tableEl || !tableEl.table) {
+      if (log) log.info(`Warning: could not locate table inserted at index ${fill.insertIndex}, skipping fill`);
+      continue;
+    }
+
+    const tableIndex = tables.indexOf(tableEl);
+    if (log) log.info(`Filling table ${tableIndex} (${fill.rows}×${fill.columns}) with data`);
+
+    // Build edits for non-empty cells
+    const edits: Array<{ row: number; col: number; text: string }> = [];
+    for (let r = 0; r < fill.data.length; r++) {
+      for (let c = 0; c < fill.data[r].length; c++) {
+        if (fill.data[r][c]) {
+          edits.push({ row: r, col: c, text: fill.data[r][c] });
+        }
+      }
+    }
+
+    if (edits.length === 0) continue;
+
+    const requests = TableHelpers.buildBatchEditCellRequests(
+      bodyContent,
+      tableIndex,
+      edits,
+      tabId,
+    );
+
+    if (requests.length > 0) {
+      await GDocsHelpers.executeBatchUpdateChunked(docs, documentId, requests, 50, log);
+    }
+
+    // Bold header row if applicable — must re-read document after cell fill
+    if (fill.hasBoldHeaders) {
+      const doc2 = await docs.documents.get({
+        documentId,
+        includeTabsContent: !!tabId,
+      });
+      let body2 = doc2.data.body?.content;
+      if (tabId) {
+        const tab2 = GDocsHelpers.findTabById(doc2.data, tabId);
+        body2 = tab2?.documentTab?.body?.content;
+      }
+      if (body2) {
+        const tables2 = TableHelpers.extractTableElements(body2);
+        const tbl2 = tables2[tableIndex];
+        if (tbl2?.table?.tableRows?.[0]?.tableCells) {
+          const boldRequests: docs_v1.Schema$Request[] = [];
+          for (const cell of tbl2.table.tableRows[0].tableCells) {
+            if (cell.content) {
+              const range = TableHelpers.getCellRange(cell);
+              if (range.endIndex > range.startIndex + 1) {
+                const styleResult = GDocsHelpers.buildUpdateTextStyleRequest(
+                  range.startIndex,
+                  range.endIndex - 1,
+                  { bold: true },
+                  tabId
+                );
+                if (styleResult) {
+                  boldRequests.push(styleResult.request);
+                }
+              }
+            }
+          }
+          if (boldRequests.length > 0) {
+            await GDocsHelpers.executeBatchUpdateChunked(docs, documentId, boldRequests, 50, log);
+            if (log) log.info(`Bolded ${boldRequests.length} header cells`);
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Executes markdown with table support using multi-phase approach.
+ * Phase 1: Insert text + insertTable for content up to the first table
+ * Phase 2: Fill table cells
+ * Phase 3: If there's postTableContent, re-read document end and recurse
+ *
+ * Max recursion depth of 10 to prevent runaway loops.
+ */
+async function executeMarkdownWithTables(
+  docs: docs_v1.Docs,
+  documentId: string,
+  markdown: string,
+  startIndex: number,
+  tabId: string | undefined,
+  log: { info: (msg: string) => void; error?: (msg: string) => void },
+  depth: number = 0
+): Promise<{ totalOps: number; totalTables: number }> {
+  if (depth > 10) {
+    throw new UserError('Too many nested tables in markdown (max 10). Simplify the document.');
+  }
+
+  const { requests, pendingTableFills, postTableContent } = convertMarkdownToRequestsWithTables(
+    markdown, startIndex, tabId
+  );
+
+  log.info(`Phase ${depth + 1}: ${requests.length} requests, ${pendingTableFills.length} tables, postTableContent: ${postTableContent ? postTableContent.length + ' chars' : 'none'}`);
+
+  let totalOps = requests.length;
+  let totalTables = pendingTableFills.length;
+
+  // Execute text + insertTable requests
+  if (requests.length > 0) {
+    await GDocsHelpers.executeBatchUpdateWithSplitting(docs, documentId, requests, log);
+  }
+
+  // Fill table cells
+  if (pendingTableFills.length > 0) {
+    await fillPendingTables(docs, documentId, pendingTableFills, tabId, log);
+  }
+
+  // If there's remaining content after the table, append it
+  if (postTableContent) {
+    // Re-read document to find current end index
+    const doc2 = await docs.documents.get({
+      documentId,
+      includeTabsContent: !!tabId,
+    });
+    let body2 = doc2.data.body?.content;
+    if (tabId) {
+      const tab2 = GDocsHelpers.findTabById(doc2.data, tabId);
+      body2 = tab2?.documentTab?.body?.content;
+    }
+    if (body2 && body2.length > 0) {
+      const lastEndIndex = body2[body2.length - 1].endIndex;
+      if (lastEndIndex == null) {
+        log.info('Warning: could not determine end index for post-table content');
+        return { totalOps, totalTables };
+      }
+      const newEndIndex = lastEndIndex - 1;
+      log.info(`Appending post-table content at index ${newEndIndex}`);
+
+      const sub = await executeMarkdownWithTables(
+        docs, documentId, postTableContent, newEndIndex, tabId, log, depth + 1
+      );
+      totalOps += sub.totalOps;
+      totalTables += sub.totalTables;
+    }
+  }
+
+  return { totalOps, totalTables };
+}
+
 // --- Markdown Tools ---
 
 server.addTool({
@@ -752,21 +933,14 @@ try {
     log.info(`Delete complete. Document now empty.`);
   }
 
-  // 4. Convert markdown to requests (indices calculated for empty document)
-  log.info(`Converting markdown starting at index ${startIndex} (after delete, document should be empty)`);
-  const markdownRequests = convertMarkdownToRequests(
-    args.markdown,
-    startIndex,
-    args.tabId
+  // 4. Execute markdown with multi-phase table support
+  log.info(`Converting and executing markdown starting at index ${startIndex}`);
+  const result = await executeMarkdownWithTables(
+    docs, args.documentId, args.markdown, startIndex, args.tabId, log
   );
-  log.info(`Generated ${markdownRequests.length} requests from markdown`);
-  log.info(`First 3 requests: ${JSON.stringify(markdownRequests.slice(0, 3), null, 2)}`);
-
-  // 5. Execute markdown requests (insert + format) in separate API call(s)
-  await GDocsHelpers.executeBatchUpdateWithSplitting(docs, args.documentId, markdownRequests, log);
 
   log.info(`Successfully replaced document content`);
-  return `Successfully replaced document content with ${args.markdown.length} characters of markdown (${markdownRequests.length} operations).`;
+  return `Successfully replaced document content with ${args.markdown.length} characters of markdown (${result.totalOps} operations, ${result.totalTables} tables).`;
 
 } catch (error: any) {
   log.error(`Error replacing document with markdown: ${error.message}`);
@@ -838,18 +1012,13 @@ try {
     log.info(`Added spacing, new start index: ${startIndex}`);
   }
 
-  // 3. Convert and append markdown
-  const markdownRequests = convertMarkdownToRequests(
-    args.markdown,
-    startIndex,
-    args.tabId
+  // 3. Execute markdown with multi-phase table support
+  const result = await executeMarkdownWithTables(
+    docs, args.documentId, args.markdown, startIndex, args.tabId, log
   );
-  log.info(`Generated ${markdownRequests.length} requests from markdown`);
-
-  await GDocsHelpers.executeBatchUpdateWithSplitting(docs, args.documentId, markdownRequests, log);
 
   log.info(`Successfully appended markdown`);
-  return `Successfully appended ${args.markdown.length} characters of markdown (${markdownRequests.length} operations).`;
+  return `Successfully appended ${args.markdown.length} characters of markdown (${result.totalOps} operations, ${result.totalTables} tables).`;
 
 } catch (error: any) {
   log.error(`Error appending markdown: ${error.message}`);
@@ -1254,6 +1423,290 @@ execute: async (args, { log }) => {
   }
 }
 });
+
+// --- Batch Table Tools ---
+
+server.addTool({
+name: 'batchEditTableCells',
+description: 'Replaces text in multiple table cells in a single operation. Much more efficient than calling editTableCell repeatedly. Fetches the document once, builds all edit requests, and executes them in chunks. Max 500 edits per call.',
+parameters: DocumentIdParameter.extend({
+  tableIndex: z.number().int().min(0).describe('The table index (0-based). Use getTableStructure to find it.'),
+  edits: z.array(z.object({
+    row: z.number().int().min(0).describe('Row index (0-based).'),
+    col: z.number().int().min(0).describe('Column index (0-based).'),
+    text: z.string().describe('New text content for the cell.'),
+  })).min(1).max(500).describe('Array of cell edits. Each edit specifies row, col, and new text.'),
+}),
+execute: async (args, { log }) => {
+  const docs = await getDocsClient();
+  log.info(`Batch editing ${args.edits.length} cells in table ${args.tableIndex}, doc ${args.documentId}`);
+  try {
+    const res = await docs.documents.get({ documentId: args.documentId });
+    if (!res.data.body?.content) {
+      throw new UserError('Document has no content.');
+    }
+
+    const requests = TableHelpers.buildBatchEditCellRequests(
+      res.data.body.content,
+      args.tableIndex,
+      args.edits,
+    );
+
+    if (requests.length === 0) {
+      return 'No changes needed.';
+    }
+
+    const apiCalls = await GDocsHelpers.executeBatchUpdateChunked(
+      docs, args.documentId, requests, 50, log
+    );
+
+    return `Updated ${args.edits.length} cells in table ${args.tableIndex} (${requests.length} requests, ${apiCalls} API calls).`;
+  } catch (error: any) {
+    log.error(`Error in batchEditTableCells: ${error.message || error}`);
+    if (error instanceof UserError) throw error;
+    if (error.code === 404) throw new UserError(`Document not found (ID: ${args.documentId}).`);
+    throw new UserError(`Failed to batch edit cells: ${error.message || 'Unknown error'}`);
+  }
+}
+});
+
+server.addTool({
+name: 'fillTableFromData',
+description: 'Fills a table from a 2D array of strings. Sugar over batchEditTableCells — converts data[][] into cell edits. Use for bulk table population from structured data.',
+parameters: DocumentIdParameter.extend({
+  tableIndex: z.number().int().min(0).describe('The table index (0-based).'),
+  data: z.array(z.array(z.string())).min(1).describe('2D array of strings. data[row][col] = cell text. Empty strings are skipped unless skipEmpty is false.'),
+  startRow: z.number().int().min(0).optional().default(0).describe('Row offset to start filling from (0-based). Default: 0.'),
+  startCol: z.number().int().min(0).optional().default(0).describe('Column offset to start filling from (0-based). Default: 0.'),
+  skipEmpty: z.boolean().optional().default(true).describe('Skip cells with empty strings. Default: true.'),
+}),
+execute: async (args, { log }) => {
+  const docs = await getDocsClient();
+  const edits: Array<{ row: number; col: number; text: string }> = [];
+
+  for (let r = 0; r < args.data.length; r++) {
+    for (let c = 0; c < args.data[r].length; c++) {
+      const text = args.data[r][c];
+      if (args.skipEmpty && text === '') continue;
+      edits.push({
+        row: (args.startRow ?? 0) + r,
+        col: (args.startCol ?? 0) + c,
+        text,
+      });
+    }
+  }
+
+  if (edits.length === 0) {
+    return 'No non-empty cells to fill.';
+  }
+
+  if (edits.length > 500) {
+    throw new UserError(`Too many cells to fill (${edits.length}). Maximum is 500. Split into multiple calls.`);
+  }
+
+  log.info(`Filling ${edits.length} cells in table ${args.tableIndex}, doc ${args.documentId}`);
+
+  try {
+    const res = await docs.documents.get({ documentId: args.documentId });
+    if (!res.data.body?.content) {
+      throw new UserError('Document has no content.');
+    }
+
+    const requests = TableHelpers.buildBatchEditCellRequests(
+      res.data.body.content,
+      args.tableIndex,
+      edits,
+    );
+
+    if (requests.length === 0) {
+      return 'No changes needed.';
+    }
+
+    const apiCalls = await GDocsHelpers.executeBatchUpdateChunked(
+      docs, args.documentId, requests, 50, log
+    );
+
+    return `Filled ${args.data.length} rows × ${args.data[0]?.length ?? 0} columns (${edits.length} cells, ${apiCalls} API calls) in table ${args.tableIndex}.`;
+  } catch (error: any) {
+    log.error(`Error in fillTableFromData: ${error.message || error}`);
+    if (error instanceof UserError) throw error;
+    if (error.code === 404) throw new UserError(`Document not found (ID: ${args.documentId}).`);
+    throw new UserError(`Failed to fill table: ${error.message || 'Unknown error'}`);
+  }
+}
+});
+
+server.addTool({
+name: 'batchInsertImagesInTable',
+description: 'Inserts images into multiple table cells in a single operation. Each image is inserted at the beginning of its cell from a public URL. Max 50 images per call.',
+parameters: DocumentIdParameter.extend({
+  tableIndex: z.number().int().min(0).describe('The table index (0-based).'),
+  images: z.array(z.object({
+    row: z.number().int().min(0).describe('Row index (0-based).'),
+    col: z.number().int().min(0).describe('Column index (0-based).'),
+    imageUrl: z.string().url().describe('Publicly accessible image URL.'),
+    width: z.number().min(1).optional().describe('Image width in points.'),
+    height: z.number().min(1).optional().describe('Image height in points.'),
+  })).min(1).max(50).describe('Array of image insertions.'),
+}),
+execute: async (args, { log }) => {
+  const docs = await getDocsClient();
+  log.info(`Batch inserting ${args.images.length} images in table ${args.tableIndex}, doc ${args.documentId}`);
+  try {
+    const res = await docs.documents.get({ documentId: args.documentId });
+    if (!res.data.body?.content) {
+      throw new UserError('Document has no content.');
+    }
+
+    const requests = TableHelpers.buildBatchInsertImageRequests(
+      res.data.body.content,
+      args.tableIndex,
+      args.images,
+    );
+
+    if (requests.length === 0) {
+      return 'No images to insert.';
+    }
+
+    const apiCalls = await GDocsHelpers.executeBatchUpdateChunked(
+      docs, args.documentId, requests, 50, log
+    );
+
+    return `Inserted ${args.images.length} images in table ${args.tableIndex} (${apiCalls} API calls).`;
+  } catch (error: any) {
+    log.error(`Error in batchInsertImagesInTable: ${error.message || error}`);
+    if (error instanceof UserError) throw error;
+    if (error.code === 404) throw new UserError(`Document not found (ID: ${args.documentId}).`);
+    throw new UserError(`Failed to batch insert images: ${error.message || 'Unknown error'}`);
+  }
+}
+});
+
+// --- Formatted Table Cell Tools ---
+
+server.addTool({
+name: 'readTableCellsFormatted',
+description: 'Reads all cells from a table with full formatting info (bold, italic, underline, colors, fonts, links). Returns per-cell FormattedRun[] arrays preserving text styles and imageInfo[] with URIs and original dimensions (width/height in PT). Use this to read rich formatting from a source table.',
+parameters: DocumentIdParameter.extend({
+  tableIndex: z.number().int().min(0).describe('The table index (0-based).'),
+}),
+execute: async (args, { log }) => {
+  const docs = await getDocsClient();
+  log.info(`Reading formatted cells from table ${args.tableIndex}, doc ${args.documentId}`);
+  try {
+    const res = await docs.documents.get({ documentId: args.documentId });
+    if (!res.data.body?.content) {
+      throw new UserError('Document has no content.');
+    }
+    const inlineObjects = res.data.inlineObjects ?? {};
+    const result = TableHelpers.readTableCellsFormatted(
+      res.data.body.content,
+      args.tableIndex,
+      inlineObjects,
+    );
+    return JSON.stringify(result, null, 2);
+  } catch (error: any) {
+    log.error(`Error in readTableCellsFormatted: ${error.message || error}`);
+    if (error instanceof UserError) throw error;
+    if (error.code === 404) throw new UserError(`Document not found (ID: ${args.documentId}).`);
+    throw new UserError(`Failed to read formatted table cells: ${error.message || 'Unknown error'}`);
+  }
+}
+});
+
+server.addTool({
+name: 'batchEditTableCellsFormatted',
+description: 'Replaces text in multiple table cells with per-run formatting (bold, italic, underline, colors, fonts, links). Two-phase: inserts text first, then applies formatting. Use readTableCellsFormatted to get source runs, then pass them here.',
+parameters: DocumentIdParameter.extend({
+  tableIndex: z.number().int().min(0).describe('The table index (0-based).'),
+  cells: z.array(z.object({
+    row: z.number().int().min(0).describe('Row index (0-based).'),
+    col: z.number().int().min(0).describe('Column index (0-based).'),
+    runs: z.array(z.object({
+      text: z.string().describe('Text content for this run.'),
+      style: z.object({
+        bold: z.boolean().optional(),
+        italic: z.boolean().optional(),
+        underline: z.boolean().optional(),
+        strikethrough: z.boolean().optional(),
+        fontSize: z.number().min(1).optional(),
+        fontFamily: z.string().optional(),
+        foregroundColor: z.string().optional().describe('Hex color e.g. #FF0000'),
+        backgroundColor: z.string().optional().describe('Hex color e.g. #FFFF00'),
+        linkUrl: z.string().optional(),
+      }).optional().describe('Text style for this run. Omit for default formatting.'),
+    })).min(1).describe('Array of text runs with optional per-run formatting.'),
+  })).min(1).max(100).describe('Array of formatted cell edits.'),
+  tabId: z.string().optional().describe('Optional tab ID for multi-tab documents.'),
+}),
+execute: async (args, { log }) => {
+  const docs = await getDocsClient();
+  log.info(`Batch editing ${args.cells.length} formatted cells in table ${args.tableIndex}, doc ${args.documentId}`);
+  // TODO: Add tabId support for multi-tab documents (currently assumes first/default tab)
+  try {
+    // Phase 1: Insert text (concatenate runs per cell)
+    let res = await docs.documents.get({ documentId: args.documentId });
+    if (!res.data.body?.content) {
+      throw new UserError('Document has no content.');
+    }
+
+    const textEdits: TableHelpers.CellEdit[] = args.cells.map(c => ({
+      row: c.row,
+      col: c.col,
+      text: c.runs.map(r => r.text).join(''),
+    }));
+
+    const textRequests = TableHelpers.buildBatchEditCellRequests(
+      res.data.body.content,
+      args.tableIndex,
+      textEdits,
+      args.tabId,
+    );
+
+    let apiCalls = 0;
+    if (textRequests.length > 0) {
+      apiCalls += await GDocsHelpers.executeBatchUpdateChunked(
+        docs, args.documentId, textRequests, 50, log
+      );
+    }
+
+    // Phase 2: Apply formatting
+    const cellsWithFormatting = args.cells.filter(c => c.runs.some(r => r.style));
+    if (cellsWithFormatting.length > 0) {
+      // Re-read doc for updated indices
+      res = await docs.documents.get({ documentId: args.documentId });
+      if (!res.data.body?.content) {
+        throw new UserError('Document has no content after text insertion.');
+      }
+      const tableEl = TableHelpers.getTableElement(res.data.body.content, args.tableIndex);
+      const table = tableEl.table!;
+
+      const formatRequests: docs_v1.Schema$Request[] = [];
+      for (const c of cellsWithFormatting) {
+        const targetCell = TableHelpers.getCellElement(table, c.row, c.col);
+        const cellStart = TableHelpers.getCellInsertionPoint(targetCell);
+        const cellFormatReqs = TableHelpers.buildFormattedCellFormatRequests(cellStart, c.runs as TableHelpers.FormattedRun[], args.tabId);
+        formatRequests.push(...cellFormatReqs);
+      }
+
+      if (formatRequests.length > 0) {
+        apiCalls += await GDocsHelpers.executeBatchUpdateChunked(
+          docs, args.documentId, formatRequests, 50, log
+        );
+      }
+    }
+
+    return `Edited ${args.cells.length} cells with formatting in table ${args.tableIndex} (${apiCalls} API calls).`;
+  } catch (error: any) {
+    log.error(`Error in batchEditTableCellsFormatted: ${error.message || error}`);
+    if (error instanceof UserError) throw error;
+    if (error.code === 404) throw new UserError(`Document not found (ID: ${args.documentId}).`);
+    throw new UserError(`Failed to batch edit formatted cells: ${error.message || 'Unknown error'}`);
+  }
+}
+});
+
+// --- Page Break Tool ---
 
 server.addTool({
 name: 'insertPageBreak',
@@ -2827,6 +3280,81 @@ execute: async (args, { log }) => {
     throw new UserError(`Failed to list spreadsheets: ${error.message || 'Unknown error'}`);
   }
 }
+});
+
+// === DOCUMENT SNAPSHOT (UNDO/REDO) TOOLS ===
+
+server.addTool({
+  name: 'createDocumentSnapshot',
+  description: 'Saves a snapshot of the current document state to the undo stack. Call this BEFORE making destructive changes (replaceDocumentWithMarkdown, deleteRange, batchEditTableCells) so you can undo them later. Max 10 snapshots per document. In-memory only — snapshots are lost when the server restarts.',
+  parameters: DocumentIdParameter.extend({
+    label: z.string().optional().default('snapshot').describe('A short label describing what this snapshot captures (e.g., "before markdown replace").'),
+  }),
+  execute: async (args, { log }) => {
+    const docs = await getDocsClient();
+    log.info(`Creating snapshot for doc ${args.documentId} with label "${args.label}"`);
+    try {
+      const snapshot = await SnapshotManager.createSnapshot(docs, args.documentId, args.label);
+      return `Snapshot created: "${snapshot.label}" (ID: ${snapshot.id}, ${new Date(snapshot.timestamp).toISOString()})`;
+    } catch (error: any) {
+      log.error(`Error creating snapshot: ${error.message || error}`);
+      if (error instanceof UserError) throw error;
+      throw new UserError(`Failed to create snapshot: ${error.message || 'Unknown error'}`);
+    }
+  }
+});
+
+server.addTool({
+  name: 'undoLastChange',
+  description: 'Restores the document to the most recent snapshot state (undo). The current state is saved to the redo stack. Requires a prior createDocumentSnapshot call. Restores text, formatting, tables, and images (image URIs may expire if too old).',
+  parameters: DocumentIdParameter,
+  execute: async (args, { log }) => {
+    const docs = await getDocsClient();
+    log.info(`Undoing last change for doc ${args.documentId}`);
+    try {
+      const result = await SnapshotManager.undoLastChange(docs, args.documentId);
+      return result.message;
+    } catch (error: any) {
+      log.error(`Error undoing change: ${error.message || error}`);
+      if (error instanceof UserError) throw error;
+      throw new UserError(`Failed to undo: ${error.message || 'Unknown error'}`);
+    }
+  }
+});
+
+server.addTool({
+  name: 'redoLastChange',
+  description: 'Re-applies the last undone change (redo). The current state is saved to the undo stack.',
+  parameters: DocumentIdParameter,
+  execute: async (args, { log }) => {
+    const docs = await getDocsClient();
+    log.info(`Redoing last change for doc ${args.documentId}`);
+    try {
+      const result = await SnapshotManager.redoLastChange(docs, args.documentId);
+      return result.message;
+    } catch (error: any) {
+      log.error(`Error redoing change: ${error.message || error}`);
+      if (error instanceof UserError) throw error;
+      throw new UserError(`Failed to redo: ${error.message || 'Unknown error'}`);
+    }
+  }
+});
+
+server.addTool({
+  name: 'listDocumentSnapshots',
+  description: 'Lists all available snapshots (undo and redo stacks) for a document. Shows snapshot IDs, labels, timestamps, and which stack they belong to.',
+  parameters: DocumentIdParameter,
+  execute: async (args, { log }) => {
+    log.info(`Listing snapshots for doc ${args.documentId}`);
+    const snapshots = SnapshotManager.listSnapshots(args.documentId);
+    if (snapshots.length === 0) {
+      return 'No snapshots found for this document. Use createDocumentSnapshot to save the current state.';
+    }
+    const lines = snapshots.map(s =>
+      `[${s.stack.toUpperCase()}] ${s.label} (ID: ${s.id}, ${new Date(s.timestamp).toISOString()})`
+    );
+    return `${snapshots.length} snapshot(s):\n${lines.join('\n')}`;
+  }
 });
 
 // --- Server Startup ---

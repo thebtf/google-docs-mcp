@@ -2,6 +2,8 @@
 // Table-specific helpers for Google Docs table editing
 import { docs_v1 } from 'googleapis';
 import { UserError } from 'fastmcp';
+import { TextStyleArgs } from './types.js';
+import { buildUpdateTextStyleRequest } from './googleDocsApiHelpers.js';
 
 // --- Types ---
 
@@ -367,6 +369,161 @@ export function buildInsertImageInCellRequest(
   return request;
 }
 
+// --- Formatted Run Types ---
+
+export interface ImageInfo {
+  uri: string;
+  width?: number;   // PT
+  height?: number;  // PT
+}
+
+export interface FormattedRun {
+  text: string;
+  style?: import('./types.js').TextStyleArgs;
+}
+
+export interface FormattedCellEdit {
+  row: number;
+  col: number;
+  runs: FormattedRun[];
+}
+
+// --- Batch Operations ---
+
+export interface CellEdit {
+  row: number;
+  col: number;
+  text: string;
+}
+
+export interface CellImageInsert {
+  row: number;
+  col: number;
+  imageUrl: string;
+  width?: number;
+  height?: number;
+}
+
+/**
+ * Builds batch edit requests for multiple cells in a single table.
+ * Fetches cell data once from the provided body content and generates
+ * all delete+insert requests sorted by descending startIndex.
+ *
+ * @param bodyContent - Document body content (fetched once by caller)
+ * @param tableIndex - Table index (0-based)
+ * @param edits - Array of {row, col, text} edits
+ * @returns Array of requests sorted by descending index, safe for sequential execution
+ */
+export function buildBatchEditCellRequests(
+  bodyContent: docs_v1.Schema$StructuralElement[],
+  tableIndex: number,
+  edits: CellEdit[],
+  tabId?: string,
+): docs_v1.Schema$Request[] {
+  const tableEl = getTableElement(bodyContent, tableIndex);
+  const table = tableEl.table!;
+
+  // Build requests per cell, tracking the cell's startIndex for sorting
+  const cellGroups: Array<{ sortIndex: number; requests: docs_v1.Schema$Request[] }> = [];
+
+  for (const edit of edits) {
+    const cell = getCellElement(table, edit.row, edit.col);
+    const textRanges = getCellTextRanges(cell);
+    const requests: docs_v1.Schema$Request[] = [];
+
+    if (textRanges.length === 0) {
+      // Empty cell — just insert
+      const insertPoint = getCellInsertionPoint(cell);
+      if (edit.text) {
+        requests.push({
+          insertText: {
+            location: { index: insertPoint, ...(tabId && { tabId }) },
+            text: edit.text,
+          },
+        });
+      }
+      cellGroups.push({ sortIndex: insertPoint, requests });
+      continue;
+    }
+
+    // Delete existing text ranges in reverse order
+    const sortedRanges = [...textRanges].sort((a, b) => b.startIndex - a.startIndex);
+    for (const range of sortedRanges) {
+      requests.push({
+        deleteContentRange: {
+          range: { startIndex: range.startIndex, endIndex: range.endIndex, ...(tabId && { tabId }) },
+        },
+      });
+    }
+
+    // Insert new text at lowest index
+    const insertPoint = textRanges.reduce((min, r) => Math.min(min, r.startIndex), Infinity);
+    if (edit.text) {
+      requests.push({
+        insertText: {
+          location: { index: insertPoint, ...(tabId && { tabId }) },
+          text: edit.text,
+        },
+      });
+    }
+
+    cellGroups.push({ sortIndex: insertPoint, requests });
+  }
+
+  // Sort cell groups by descending sortIndex to prevent index shifting
+  cellGroups.sort((a, b) => b.sortIndex - a.sortIndex);
+
+  // Flatten into single array preserving group order
+  return cellGroups.flatMap(g => g.requests);
+}
+
+/**
+ * Builds batch image insert requests for multiple cells in a single table.
+ * Images are inserted at the beginning of each cell.
+ * Requests are sorted by descending insertion index.
+ *
+ * @param bodyContent - Document body content
+ * @param tableIndex - Table index (0-based)
+ * @param images - Array of {row, col, imageUrl, width?, height?}
+ * @returns Array of insertInlineImage requests sorted by descending index
+ */
+export function buildBatchInsertImageRequests(
+  bodyContent: docs_v1.Schema$StructuralElement[],
+  tableIndex: number,
+  images: CellImageInsert[],
+  tabId?: string,
+): docs_v1.Schema$Request[] {
+  const tableEl = getTableElement(bodyContent, tableIndex);
+  const table = tableEl.table!;
+
+  const requests: Array<{ insertIndex: number; request: docs_v1.Schema$Request }> = [];
+
+  for (const img of images) {
+    const cell = getCellElement(table, img.row, img.col);
+    const insertPoint = getCellInsertionPoint(cell);
+
+    const request: docs_v1.Schema$Request = {
+      insertInlineImage: {
+        location: { index: insertPoint, ...(tabId && { tabId }) },
+        uri: img.imageUrl,
+        ...(img.width != null && img.height != null && {
+          objectSize: {
+            height: { magnitude: img.height, unit: 'PT' },
+            width: { magnitude: img.width, unit: 'PT' },
+          },
+        }),
+      },
+    };
+
+    requests.push({ insertIndex: insertPoint, request });
+  }
+
+  // Sort by descending insertion index
+  requests.sort((a, b) => b.insertIndex - a.insertIndex);
+
+  return requests.map(r => r.request);
+}
+
 /**
  * Finds rows in a table where a specific column contains the search text.
  * Returns matching row indices and the full row data.
@@ -432,4 +589,183 @@ export function buildAddTableRowRequest(
       insertBelow: true,
     },
   };
+}
+
+// --- Rich Formatting Helpers ---
+
+/**
+ * Converts Google Docs API RGB color (0.0-1.0 floats) to hex string.
+ */
+export function rgbToHex(rgb: docs_v1.Schema$RgbColor): string {
+  const r = Math.round((rgb.red ?? 0) * 255);
+  const g = Math.round((rgb.green ?? 0) * 255);
+  const b = Math.round((rgb.blue ?? 0) * 255);
+  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+}
+
+/**
+ * Extracts formatted content from a source cell, preserving per-run text styles
+ * and inline image URIs. Handles \u000b (in-cell line breaks) properly.
+ *
+ * @param cell - Source table cell
+ * @param inlineObjects - Document's inlineObjects map for resolving image URIs
+ * @returns runs (text with style) and imageUris found in the cell
+ */
+export function extractFormattedCellContent(
+  cell: docs_v1.Schema$TableCell,
+  inlineObjects?: Record<string, docs_v1.Schema$InlineObject>
+): { runs: FormattedRun[]; imageInfo: ImageInfo[] } {
+  const runs: FormattedRun[] = [];
+  const imageInfo: ImageInfo[] = [];
+
+  if (!cell.content) return { runs, imageInfo };
+
+  const paragraphs = cell.content.filter(el => el.paragraph);
+
+  for (let pIdx = 0; pIdx < paragraphs.length; pIdx++) {
+    const para = paragraphs[pIdx].paragraph!;
+    if (!para.elements) continue;
+
+    // Add \u000b between paragraphs (not before first, not after last)
+    if (pIdx > 0 && runs.length > 0) {
+      runs.push({ text: '\u000b' });
+    }
+
+    for (const pe of para.elements) {
+      // Handle inline images
+      if (pe.inlineObjectElement?.inlineObjectId) {
+        const objId = pe.inlineObjectElement.inlineObjectId;
+        if (inlineObjects?.[objId]) {
+          const embeddedObj = inlineObjects[objId].inlineObjectProperties?.embeddedObject;
+          const uri = embeddedObj?.imageProperties?.contentUri
+            ?? embeddedObj?.imageProperties?.sourceUri;
+          if (uri) {
+            const size = embeddedObj?.size;
+            imageInfo.push({
+              uri,
+              width: size?.width?.magnitude ?? undefined,
+              height: size?.height?.magnitude ?? undefined,
+            });
+          }
+        }
+        continue;
+      }
+
+      // Handle text runs
+      if (pe.textRun?.content) {
+        let content = pe.textRun.content;
+
+        // Strip trailing \n only from the last element of the last paragraph
+        const isLastParagraph = pIdx === paragraphs.length - 1;
+        const isLastElement = pe === para.elements[para.elements.length - 1];
+        if (isLastParagraph && isLastElement && content.endsWith('\n')) {
+          content = content.slice(0, -1);
+        }
+
+        if (content.length === 0) continue;
+
+        // Extract text style
+        const ts = pe.textRun.textStyle;
+        const style: TextStyleArgs = {};
+        let hasStyle = false;
+
+        if (ts?.bold) { style.bold = true; hasStyle = true; }
+        if (ts?.italic) { style.italic = true; hasStyle = true; }
+        if (ts?.underline) { style.underline = true; hasStyle = true; }
+        if (ts?.strikethrough) { style.strikethrough = true; hasStyle = true; }
+        if (ts?.foregroundColor?.color?.rgbColor) {
+          const hex = rgbToHex(ts.foregroundColor.color.rgbColor);
+          if (hex !== '#000000') { style.foregroundColor = hex; hasStyle = true; }
+        }
+        if (ts?.backgroundColor?.color?.rgbColor) {
+          style.backgroundColor = rgbToHex(ts.backgroundColor.color.rgbColor);
+          hasStyle = true;
+        }
+        if (ts?.fontSize?.magnitude) {
+          style.fontSize = ts.fontSize.magnitude;
+          hasStyle = true;
+        }
+        if (ts?.weightedFontFamily?.fontFamily) {
+          style.fontFamily = ts.weightedFontFamily.fontFamily;
+          hasStyle = true;
+        }
+        if (ts?.link?.url) {
+          style.linkUrl = ts.link.url;
+          hasStyle = true;
+        }
+
+        runs.push({ text: content, ...(hasStyle ? { style } : {}) });
+      }
+    }
+  }
+
+  return { runs, imageInfo };
+}
+
+/**
+ * Given a target cell's startIndex and the FormattedRun[] that was inserted,
+ * calculates run boundaries and generates updateTextStyle requests.
+ *
+ * @param cellStartIndex - The startIndex of the cell content after text insertion
+ * @param runs - The FormattedRun[] used during text insertion
+ * @param tabId - Optional tab ID
+ * @returns Array of updateTextStyle requests
+ */
+export function buildFormattedCellFormatRequests(
+  cellStartIndex: number,
+  runs: FormattedRun[],
+  tabId?: string
+): docs_v1.Schema$Request[] {
+  const requests: docs_v1.Schema$Request[] = [];
+  let offset = cellStartIndex;
+
+  for (const run of runs) {
+    const runEnd = offset + run.text.length;
+
+    if (run.style && run.text.length > 0) {
+      const result = buildUpdateTextStyleRequest(offset, runEnd, run.style, tabId);
+      if (result) {
+        requests.push(result.request);
+      }
+    }
+
+    offset = runEnd;
+  }
+
+  return requests;
+}
+
+/**
+ * Reads all cells from a table and returns formatted content (runs + images) per cell.
+ */
+export function readTableCellsFormatted(
+  bodyContent: docs_v1.Schema$StructuralElement[],
+  tableIndex: number,
+  inlineObjects?: Record<string, docs_v1.Schema$InlineObject>
+): {
+  tableIndex: number;
+  rows: number;
+  columns: number;
+  cells: Array<Array<{ runs: FormattedRun[]; imageInfo: ImageInfo[] }>>;
+} {
+  const tableEl = getTableElement(bodyContent, tableIndex);
+  const table = tableEl.table!;
+  const rows = table.tableRows?.length ?? 0;
+  const columns = table.columns ?? 0;
+
+  const cells: Array<Array<{ runs: FormattedRun[]; imageInfo: ImageInfo[] }>> = [];
+
+  if (table.tableRows) {
+    for (const tableRow of table.tableRows) {
+      const rowCells: Array<{ runs: FormattedRun[]; imageInfo: ImageInfo[] }> = [];
+      if (tableRow.tableCells) {
+        for (const cell of tableRow.tableCells) {
+          rowCells.push(extractFormattedCellContent(cell, inlineObjects));
+        }
+      }
+      cells.push(rowCells);
+    }
+  }
+
+  return { tableIndex, rows, columns, cells };
 }
