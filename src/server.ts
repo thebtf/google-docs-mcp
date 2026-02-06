@@ -24,6 +24,7 @@ import * as GDocsHelpers from './googleDocsApiHelpers.js';
 import * as SheetsHelpers from './googleSheetsApiHelpers.js';
 import * as TableHelpers from './tableHelpers.js';
 import { convertMarkdownToRequests, convertMarkdownToRequestsWithTables, type PendingTableFill } from './markdownToGoogleDocs.js';
+import * as SnapshotManager from './snapshotManager.js';
 
 let authClient: OAuth2Client | null = null;
 let googleDocs: docs_v1.Docs | null = null;
@@ -1554,7 +1555,7 @@ execute: async (args, { log }) => {
 
 server.addTool({
 name: 'readTableCellsFormatted',
-description: 'Reads all cells from a table with full formatting info (bold, italic, underline, colors, fonts, links). Returns per-cell FormattedRun[] arrays preserving text styles and inline image URIs. Use this to read rich formatting from a source table.',
+description: 'Reads all cells from a table with full formatting info (bold, italic, underline, colors, fonts, links). Returns per-cell FormattedRun[] arrays preserving text styles and imageInfo[] with URIs and original dimensions (width/height in PT). Use this to read rich formatting from a source table.',
 parameters: DocumentIdParameter.extend({
   tableIndex: z.number().int().min(0).describe('The table index (0-based).'),
 }),
@@ -3245,6 +3246,81 @@ execute: async (args, { log }) => {
     throw new UserError(`Failed to list spreadsheets: ${error.message || 'Unknown error'}`);
   }
 }
+});
+
+// === DOCUMENT SNAPSHOT (UNDO/REDO) TOOLS ===
+
+server.addTool({
+  name: 'createDocumentSnapshot',
+  description: 'Saves a snapshot of the current document state to the undo stack. Call this BEFORE making destructive changes (replaceDocumentWithMarkdown, deleteRange, batchEditTableCells) so you can undo them later. Max 10 snapshots per document. In-memory only — snapshots are lost when the server restarts.',
+  parameters: DocumentIdParameter.extend({
+    label: z.string().optional().default('snapshot').describe('A short label describing what this snapshot captures (e.g., "before markdown replace").'),
+  }),
+  execute: async (args, { log }) => {
+    const docs = await getDocsClient();
+    log.info(`Creating snapshot for doc ${args.documentId} with label "${args.label}"`);
+    try {
+      const snapshot = await SnapshotManager.createSnapshot(docs, args.documentId, args.label);
+      return `Snapshot created: "${snapshot.label}" (ID: ${snapshot.id}, ${new Date(snapshot.timestamp).toISOString()})`;
+    } catch (error: any) {
+      log.error(`Error creating snapshot: ${error.message || error}`);
+      if (error instanceof UserError) throw error;
+      throw new UserError(`Failed to create snapshot: ${error.message || 'Unknown error'}`);
+    }
+  }
+});
+
+server.addTool({
+  name: 'undoLastChange',
+  description: 'Restores the document to the most recent snapshot state (undo). The current state is saved to the redo stack. Requires a prior createDocumentSnapshot call. Restores text, formatting, tables, and images (image URIs may expire if too old).',
+  parameters: DocumentIdParameter,
+  execute: async (args, { log }) => {
+    const docs = await getDocsClient();
+    log.info(`Undoing last change for doc ${args.documentId}`);
+    try {
+      const result = await SnapshotManager.undoLastChange(docs, args.documentId);
+      return result.message;
+    } catch (error: any) {
+      log.error(`Error undoing change: ${error.message || error}`);
+      if (error instanceof UserError) throw error;
+      throw new UserError(`Failed to undo: ${error.message || 'Unknown error'}`);
+    }
+  }
+});
+
+server.addTool({
+  name: 'redoLastChange',
+  description: 'Re-applies the last undone change (redo). The current state is saved to the undo stack.',
+  parameters: DocumentIdParameter,
+  execute: async (args, { log }) => {
+    const docs = await getDocsClient();
+    log.info(`Redoing last change for doc ${args.documentId}`);
+    try {
+      const result = await SnapshotManager.redoLastChange(docs, args.documentId);
+      return result.message;
+    } catch (error: any) {
+      log.error(`Error redoing change: ${error.message || error}`);
+      if (error instanceof UserError) throw error;
+      throw new UserError(`Failed to redo: ${error.message || 'Unknown error'}`);
+    }
+  }
+});
+
+server.addTool({
+  name: 'listDocumentSnapshots',
+  description: 'Lists all available snapshots (undo and redo stacks) for a document. Shows snapshot IDs, labels, timestamps, and which stack they belong to.',
+  parameters: DocumentIdParameter,
+  execute: async (args, { log }) => {
+    log.info(`Listing snapshots for doc ${args.documentId}`);
+    const snapshots = SnapshotManager.listSnapshots(args.documentId);
+    if (snapshots.length === 0) {
+      return 'No snapshots found for this document. Use createDocumentSnapshot to save the current state.';
+    }
+    const lines = snapshots.map(s =>
+      `[${s.stack.toUpperCase()}] ${s.label} (ID: ${s.id}, ${new Date(s.timestamp).toISOString()})`
+    );
+    return `${snapshots.length} snapshot(s):\n${lines.join('\n')}`;
+  }
 });
 
 // --- Server Startup ---

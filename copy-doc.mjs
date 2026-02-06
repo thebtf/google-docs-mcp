@@ -118,9 +118,9 @@ async function getInsertionPoint(docs) {
  */
 function extractParagraphRuns(paragraph, inlineObjects) {
   const runs = [];
-  const imageUris = [];
+  const imageInfo = [];
 
-  if (!paragraph.elements) return { runs, imageUris };
+  if (!paragraph.elements) return { runs, imageInfo };
 
   for (const pe of paragraph.elements) {
     if (pe.inlineObjectElement?.inlineObjectId) {
@@ -130,7 +130,14 @@ function extractParagraphRuns(paragraph, inlineObjects) {
         const embeddedObj = obj.inlineObjectProperties?.embeddedObject;
         const uri = embeddedObj?.imageProperties?.contentUri
           ?? embeddedObj?.imageProperties?.sourceUri;
-        if (uri) imageUris.push(uri);
+        if (uri) {
+          const size = embeddedObj?.size;
+          imageInfo.push({
+            uri,
+            width: size?.width?.magnitude,
+            height: size?.height?.magnitude,
+          });
+        }
       }
       continue;
     }
@@ -173,7 +180,7 @@ function extractParagraphRuns(paragraph, inlineObjects) {
     }
   }
 
-  return { runs, imageUris };
+  return { runs, imageInfo };
 }
 
 /**
@@ -190,17 +197,17 @@ async function copyParagraphBatch(docs, paragraphElements, inlineObjects) {
   const paraData = [];
   for (const el of paragraphElements) {
     const para = el.paragraph;
-    const { runs, imageUris } = extractParagraphRuns(para, inlineObjects);
+    const { runs, imageInfo } = extractParagraphRuns(para, inlineObjects);
     const namedStyle = para.paragraphStyle?.namedStyleType;
     const fullText = runs.map(r => r.text).join('');
-    paraData.push({ runs, imageUris, namedStyle, fullText });
+    paraData.push({ runs, imageInfo, namedStyle, fullText });
   }
 
   // Build combined text: each paragraph's text + \n
   // All paragraphs concatenated, inserted at insertPoint
   const allText = paraData.map(p => p.fullText + '\n').join('');
 
-  if (allText.trim().length === 0 && paraData.every(p => p.imageUris.length === 0)) {
+  if (allText.trim().length === 0 && paraData.every(p => p.imageInfo.length === 0)) {
     // All empty paragraphs — insert newlines
     if (allText.length > 0) {
       await GDocsHelpers.executeBatchUpdate(docs, TEST_DOC_ID, [{
@@ -258,23 +265,30 @@ async function copyParagraphBatch(docs, paragraphElements, inlineObjects) {
   log.info(`  Copied ${paraData.length} paragraphs (${allText.length} chars, ${formatRequests.length} format ops)`);
 
   // Phase 3: Insert images
-  const imagesNeeded = paraData.filter(p => p.imageUris.length > 0);
+  const imagesNeeded = paraData.filter(p => p.imageInfo.length > 0);
   if (imagesNeeded.length > 0) {
     // For images we need to re-read doc and insert at correct positions
     // For now, insert images sequentially as they need accurate positions
     for (const pd of imagesNeeded) {
-      for (const uri of pd.imageUris) {
+      for (const img of pd.imageInfo) {
         try {
           const imgPoint = await getInsertionPoint(docs);
-          await GDocsHelpers.executeBatchUpdate(docs, TEST_DOC_ID, [{
+          const req = {
             insertInlineImage: {
               location: { index: imgPoint },
-              uri: uri,
+              uri: img.uri,
+              ...(img.width && img.height && {
+                objectSize: {
+                  height: { magnitude: img.height, unit: 'PT' },
+                  width: { magnitude: img.width, unit: 'PT' },
+                },
+              }),
             }
-          }]);
-          log.info(`  Inserted image: ${uri.substring(0, 60)}...`);
+          };
+          await GDocsHelpers.executeBatchUpdate(docs, TEST_DOC_ID, [req]);
+          log.info(`  Inserted image: ${img.uri.substring(0, 60)}... (${img.width || '?'}x${img.height || '?'}pt)`);
         } catch (e) {
-          log.error(`  Failed to insert image ${uri.substring(0, 60)}: ${e.message}`);
+          log.error(`  Failed to insert image ${img.uri.substring(0, 60)}: ${e.message}`);
         }
       }
     }
@@ -308,9 +322,9 @@ async function copyTable(docs, table, inlineObjects) {
   for (let r = 0; r < tableRows.length; r++) {
     const cells = tableRows[r].tableCells || [];
     for (let c = 0; c < cells.length; c++) {
-      const { runs, imageUris } = TableHelpers.extractFormattedCellContent(cells[c], inlineObjects);
-      if (runs.length > 0 || imageUris.length > 0) {
-        cellData.push({ row: r, col: c, runs, imageUris });
+      const { runs, imageInfo } = TableHelpers.extractFormattedCellContent(cells[c], inlineObjects);
+      if (runs.length > 0 || imageInfo.length > 0) {
+        cellData.push({ row: r, col: c, runs, imageInfo });
       }
     }
   }
@@ -363,15 +377,21 @@ async function copyTable(docs, table, inlineObjects) {
   }
 
   // Step E: Insert images into cells (phase 3)
-  const cellsWithImages = cellData.filter(cd => cd.imageUris.length > 0);
+  const cellsWithImages = cellData.filter(cd => cd.imageInfo.length > 0);
   if (cellsWithImages.length > 0) {
     doc2 = await docs.documents.get({ documentId: TEST_DOC_ID });
     body2 = doc2.data.body?.content || [];
 
     const imageInserts = [];
     for (const cd of cellsWithImages) {
-      for (const uri of cd.imageUris) {
-        imageInserts.push({ row: cd.row, col: cd.col, imageUrl: uri });
+      for (const img of cd.imageInfo) {
+        imageInserts.push({
+          row: cd.row,
+          col: cd.col,
+          imageUrl: img.uri,
+          width: img.width,
+          height: img.height,
+        });
       }
     }
 

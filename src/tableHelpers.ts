@@ -371,6 +371,12 @@ export function buildInsertImageInCellRequest(
 
 // --- Formatted Run Types ---
 
+export interface ImageInfo {
+  uri: string;
+  width?: number;   // PT
+  height?: number;  // PT
+}
+
 export interface FormattedRun {
   text: string;
   style?: import('./types.js').TextStyleArgs;
@@ -606,11 +612,11 @@ export function rgbToHex(rgb: docs_v1.Schema$RgbColor): string {
 export function extractFormattedCellContent(
   cell: docs_v1.Schema$TableCell,
   inlineObjects?: Record<string, docs_v1.Schema$InlineObject>
-): { runs: FormattedRun[]; imageUris: string[] } {
+): { runs: FormattedRun[]; imageInfo: ImageInfo[] } {
   const runs: FormattedRun[] = [];
-  const imageUris: string[] = [];
+  const imageInfo: ImageInfo[] = [];
 
-  if (!cell.content) return { runs, imageUris };
+  if (!cell.content) return { runs, imageInfo };
 
   const paragraphs = cell.content.filter(el => el.paragraph);
 
@@ -631,7 +637,14 @@ export function extractFormattedCellContent(
           const embeddedObj = inlineObjects[objId].inlineObjectProperties?.embeddedObject;
           const uri = embeddedObj?.imageProperties?.contentUri
             ?? embeddedObj?.imageProperties?.sourceUri;
-          if (uri) imageUris.push(uri);
+          if (uri) {
+            const size = embeddedObj?.size;
+            imageInfo.push({
+              uri,
+              width: size?.width?.magnitude ?? undefined,
+              height: size?.height?.magnitude ?? undefined,
+            });
+          }
         }
         continue;
       }
@@ -684,7 +697,7 @@ export function extractFormattedCellContent(
     }
   }
 
-  return { runs, imageUris };
+  return { runs, imageInfo };
 }
 
 /**
@@ -731,18 +744,18 @@ export function readTableCellsFormatted(
   tableIndex: number;
   rows: number;
   columns: number;
-  cells: Array<Array<{ runs: FormattedRun[]; imageUris: string[] }>>;
+  cells: Array<Array<{ runs: FormattedRun[]; imageInfo: ImageInfo[] }>>;
 } {
   const tableEl = getTableElement(bodyContent, tableIndex);
   const table = tableEl.table!;
   const rows = table.tableRows?.length ?? 0;
   const columns = table.columns ?? 0;
 
-  const cells: Array<Array<{ runs: FormattedRun[]; imageUris: string[] }>> = [];
+  const cells: Array<Array<{ runs: FormattedRun[]; imageInfo: ImageInfo[] }>> = [];
 
   if (table.tableRows) {
     for (const tableRow of table.tableRows) {
-      const rowCells: Array<{ runs: FormattedRun[]; imageUris: string[] }> = [];
+      const rowCells: Array<{ runs: FormattedRun[]; imageInfo: ImageInfo[] }> = [];
       if (tableRow.tableCells) {
         for (const cell of tableRow.tableCells) {
           rowCells.push(extractFormattedCellContent(cell, inlineObjects));
