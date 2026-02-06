@@ -133,6 +133,43 @@ export async function executeBatchUpdateWithSplitting(
     }
 }
 
+// --- Chunked Batch Update (no re-fetch between chunks) ---
+
+/**
+ * Executes a pre-sorted array of requests in chunks without re-fetching the document.
+ * Requests MUST already be sorted in correct execution order (typically descending index).
+ * Groups are preserved: consecutive requests belonging to the same cell edit are never split.
+ *
+ * @param docs - Google Docs API client
+ * @param documentId - Document ID
+ * @param requests - Pre-sorted array of requests
+ * @param chunkSize - Max requests per API call (default 50)
+ * @param log - Optional logger
+ * @returns Total number of API calls made
+ */
+export async function executeBatchUpdateChunked(
+    docs: Docs,
+    documentId: string,
+    requests: docs_v1.Schema$Request[],
+    chunkSize: number = MAX_BATCH_UPDATE_REQUESTS,
+    log?: { info: (msg: string) => void }
+): Promise<number> {
+    if (!requests || requests.length === 0) return 0;
+
+    let apiCalls = 0;
+    for (let i = 0; i < requests.length; i += chunkSize) {
+        const batch = requests.slice(i, i + chunkSize);
+        await executeBatchUpdate(docs, documentId, batch);
+        apiCalls++;
+        if (log) {
+            const batchNum = Math.floor(i / chunkSize) + 1;
+            const totalBatches = Math.ceil(requests.length / chunkSize);
+            log.info(`Chunk ${batchNum}/${totalBatches}: ${batch.length} requests`);
+        }
+    }
+    return apiCalls;
+}
+
 // --- Text Finding Helper ---
 // This improved version is more robust in handling various text structure scenarios
 export async function findTextRange(docs: Docs, documentId: string, textToFind: string, instance: number = 1): Promise<{ startIndex: number; endIndex: number } | null> {

@@ -40,6 +40,33 @@ interface PendingListItem {
   isOrdered: boolean;
 }
 
+// --- Table State Types ---
+
+interface TableBuildState {
+  insertIndex: number;
+  rows: number;
+  columns: number;
+  cells: string[][];
+  headerCells: string[];
+  currentRow: string[];
+  inHead: boolean;
+  inBody: boolean;
+  currentCellText: string;
+  /** Line range from markdown-it token.map [startLine, endLine) */
+  sourceMap?: [number, number];
+}
+
+/**
+ * Describes a table that needs to be filled after insertTable is executed.
+ */
+export interface PendingTableFill {
+  insertIndex: number;
+  data: string[][];
+  rows: number;
+  columns: number;
+  hasBoldHeaders: boolean;
+}
+
 interface ConversionContext {
   currentIndex: number;
   insertRequests: docs_v1.Schema$Request[];
@@ -49,29 +76,61 @@ interface ConversionContext {
   listStack: ListState[];
   paragraphRanges: ParagraphRange[];
   pendingListItems: PendingListItem[];
-  listIds: Map<string, string>; // Maps list type+level to listId
+  listIds: Map<string, string>;
   tabId?: string;
   currentParagraphStart?: number;
   currentHeadingLevel?: number;
+  tableState?: TableBuildState;
+  pendingTableFills: PendingTableFill[];
+  /** Set to true when a table is closed — stops further token processing */
+  stopAfterTable: boolean;
+  /** Original markdown text for splitting at table boundaries */
+  originalMarkdown: string;
+  /** Line number where the last table ended (exclusive) */
+  lastTableEndLine?: number;
 }
 
-// --- Main Conversion Function ---
+export interface MarkdownConversionResult {
+  requests: docs_v1.Schema$Request[];
+  pendingTableFills: PendingTableFill[];
+  /** Remaining markdown content after the last table (for multi-phase execution) */
+  postTableContent?: string;
+}
+
+// --- Main Conversion Functions ---
 
 /**
- * Converts markdown text to Google Docs API batch update requests
- *
- * @param markdown - The markdown content to convert
- * @param startIndex - The document index where content should be inserted (1-based)
- * @param tabId - Optional tab ID for multi-tab documents
- * @returns Array of Google Docs API requests (insertions + formatting)
+ * Converts markdown text to Google Docs API batch update requests.
+ * (Backward-compatible — ignores table fill data and post-table content)
  */
 export function convertMarkdownToRequests(
   markdown: string,
   startIndex: number = 1,
   tabId?: string
 ): docs_v1.Schema$Request[] {
+  return convertMarkdownToRequestsWithTables(markdown, startIndex, tabId).requests;
+}
+
+/**
+ * Converts markdown text to Google Docs API requests WITH table fill information.
+ *
+ * When a GFM table is encountered, processing stops at the table boundary.
+ * The insertTable request is included in `requests`, cell data in `pendingTableFills`,
+ * and any remaining markdown after the table in `postTableContent`.
+ *
+ * The caller must:
+ * 1. Execute `requests` (via executeBatchUpdateWithSplitting)
+ * 2. Fill tables using `pendingTableFills`
+ * 3. If `postTableContent` exists, re-read the document end index and
+ *    recursively call this function for the remaining content.
+ */
+export function convertMarkdownToRequestsWithTables(
+  markdown: string,
+  startIndex: number = 1,
+  tabId?: string
+): MarkdownConversionResult {
   if (!markdown || markdown.trim().length === 0) {
-    return [];
+    return { requests: [], pendingTableFills: [] };
   }
 
   const parsed = parseMarkdown(markdown);
@@ -86,20 +145,35 @@ export function convertMarkdownToRequests(
     paragraphRanges: [],
     pendingListItems: [],
     listIds: new Map(),
-    tabId
+    tabId,
+    pendingTableFills: [],
+    stopAfterTable: false,
+    originalMarkdown: markdown,
   };
 
   try {
-    // Process all tokens
     for (const token of parsed.tokens) {
+      if (context.stopAfterTable) break;
       processToken(token, context);
     }
 
-    // Finalize any pending formatting
     finalizeFormatting(context);
 
-    // Return all requests: insertions first, then formatting
-    return [...context.insertRequests, ...context.formatRequests];
+    // Determine remaining markdown after the last table
+    let postTableContent: string | undefined;
+    if (context.stopAfterTable && context.lastTableEndLine != null) {
+      const lines = markdown.split('\n');
+      const remaining = lines.slice(context.lastTableEndLine).join('\n').trim();
+      if (remaining.length > 0) {
+        postTableContent = remaining;
+      }
+    }
+
+    return {
+      requests: [...context.insertRequests, ...context.formatRequests],
+      pendingTableFills: context.pendingTableFills,
+      postTableContent,
+    };
   } catch (error) {
     if (error instanceof MarkdownConversionError) {
       throw error;
@@ -159,12 +233,13 @@ function processToken(token: Token, context: ConversionContext): void {
       break;
 
     // Links
-    case 'link_open':
+    case 'link_open': {
       const href = getLinkHref(token);
       if (href) {
         context.formattingStack.push({ link: href });
       }
       break;
+    }
     case 'link_close':
       popFormatting(context, 'link');
       break;
@@ -214,36 +289,150 @@ function processToken(token: Token, context: ConversionContext): void {
       }
       break;
 
-    // Tables (basic support)
+    // --- Table handling ---
     case 'table_open':
-      // Tables are complex - we'll skip for now and add in a future enhancement
-      // throw new MarkdownConversionError('Table conversion not yet implemented');
+      handleTableOpen(token, context);
+      break;
+    case 'table_close':
+      handleTableClose(context);
+      break;
+    case 'thead_open':
+      if (context.tableState) context.tableState.inHead = true;
+      break;
+    case 'thead_close':
+      if (context.tableState) context.tableState.inHead = false;
+      break;
+    case 'tbody_open':
+      if (context.tableState) context.tableState.inBody = true;
+      break;
+    case 'tbody_close':
+      if (context.tableState) context.tableState.inBody = false;
+      break;
+    case 'tr_open':
+      if (context.tableState) context.tableState.currentRow = [];
+      break;
+    case 'tr_close':
+      handleTableRowClose(context);
+      break;
+    case 'th_open':
+    case 'td_open':
+      if (context.tableState) context.tableState.currentCellText = '';
+      break;
+    case 'th_close':
+    case 'td_close':
+      handleTableCellClose(context);
       break;
 
-    // Ignore these tokens (structural)
-    case 'tbody_open':
-    case 'tbody_close':
-    case 'thead_open':
-    case 'thead_close':
-    case 'tr_open':
-    case 'tr_close':
-    case 'th_open':
-    case 'th_close':
-    case 'td_open':
-    case 'td_close':
-    case 'table_close':
+    // Other structural tokens
     case 'fence':
     case 'code_block':
     case 'blockquote_open':
     case 'blockquote_close':
     case 'hr':
-      // Skip for now - can be added in future enhancements
       break;
 
     default:
-      // console.warn(`Unhandled token type: ${token.type}`);
       break;
   }
+}
+
+// --- Table Handlers ---
+
+function handleTableOpen(token: Token, context: ConversionContext): void {
+  context.tableState = {
+    insertIndex: context.currentIndex,
+    rows: 0,
+    columns: 0,
+    cells: [],
+    headerCells: [],
+    currentRow: [],
+    inHead: false,
+    inBody: false,
+    currentCellText: '',
+    sourceMap: token.map as [number, number] | undefined,
+  };
+}
+
+function handleTableCellClose(context: ConversionContext): void {
+  if (!context.tableState) return;
+  context.tableState.currentRow.push(context.tableState.currentCellText);
+  context.tableState.currentCellText = '';
+}
+
+function handleTableRowClose(context: ConversionContext): void {
+  if (!context.tableState) return;
+  const ts = context.tableState;
+
+  if (ts.inHead) {
+    ts.headerCells = [...ts.currentRow];
+    ts.columns = Math.max(ts.columns, ts.currentRow.length);
+  } else {
+    ts.cells.push([...ts.currentRow]);
+    ts.columns = Math.max(ts.columns, ts.currentRow.length);
+  }
+
+  ts.currentRow = [];
+}
+
+function handleTableClose(context: ConversionContext): void {
+  if (!context.tableState) return;
+  const ts = context.tableState;
+
+  // Build full data: header row + body rows
+  const allData: string[][] = [];
+  if (ts.headerCells.length > 0) {
+    allData.push(ts.headerCells);
+  }
+  for (const row of ts.cells) {
+    allData.push(row);
+  }
+
+  const totalRows = allData.length;
+  const totalColumns = ts.columns;
+
+  if (totalRows === 0 || totalColumns === 0) {
+    context.tableState = undefined;
+    return;
+  }
+
+  // Pad rows to equal column count
+  for (const row of allData) {
+    while (row.length < totalColumns) {
+      row.push('');
+    }
+  }
+
+  // Generate insertTable request
+  const location: any = { index: ts.insertIndex };
+  if (context.tabId) {
+    location.tabId = context.tabId;
+  }
+
+  context.insertRequests.push({
+    insertTable: {
+      location,
+      rows: totalRows,
+      columns: totalColumns,
+    },
+  });
+
+  context.pendingTableFills.push({
+    insertIndex: ts.insertIndex,
+    data: allData,
+    rows: totalRows,
+    columns: totalColumns,
+    hasBoldHeaders: ts.headerCells.length > 0,
+  });
+
+  // Record source line for splitting remaining markdown
+  if (ts.sourceMap) {
+    context.lastTableEndLine = ts.sourceMap[1];
+  }
+
+  // STOP processing further tokens — we can't predict post-table indices.
+  // Remaining content will be handled in a second pass by the caller.
+  context.stopAfterTable = true;
+  context.tableState = undefined;
 }
 
 // --- Heading Handlers ---
@@ -276,16 +465,15 @@ function handleHeadingClose(context: ConversionContext): void {
 // --- Paragraph Handlers ---
 
 function handleParagraphOpen(context: ConversionContext): void {
-  // Skip if we're in a list - list items handle their own paragraphs
-  if (context.listStack.length === 0) {
+  // Skip if we're in a list or table
+  if (context.listStack.length === 0 && !context.tableState) {
     context.currentParagraphStart = context.currentIndex;
   }
 }
 
 function handleParagraphClose(context: ConversionContext): void {
-  // Skip if we're in a list
-  if (context.listStack.length === 0) {
-    // Add double newline after paragraph for spacing
+  // Skip if we're in a list or table
+  if (context.listStack.length === 0 && !context.tableState) {
     insertText('\n\n', context);
     context.currentParagraphStart = undefined;
   }
@@ -301,16 +489,13 @@ function handleListItemOpen(context: ConversionContext): void {
   const currentList = context.listStack[context.listStack.length - 1];
   const listKey = `${currentList.type}_${currentList.level}`;
 
-  // Get or create list ID
   if (!context.listIds.has(listKey)) {
-    // Generate a unique list ID
     const listId = `list_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
     context.listIds.set(listKey, listId);
   }
 
   const listId = context.listIds.get(listKey)!;
 
-  // Track the start of this list item
   const itemStart = context.currentIndex;
   context.pendingListItems.push({
     startIndex: itemStart,
@@ -324,8 +509,6 @@ function handleListItemClose(context: ConversionContext): void {
   if (context.pendingListItems.length > 0) {
     const lastItem = context.pendingListItems[context.pendingListItems.length - 1];
     lastItem.endIndex = context.currentIndex;
-
-    // Add newline after list item
     insertText('\n', context);
   }
 }
@@ -336,13 +519,17 @@ function handleTextToken(token: Token, context: ConversionContext): void {
   const text = token.content;
   if (!text) return;
 
+  // If inside a table cell, accumulate text instead of inserting
+  if (context.tableState) {
+    context.tableState.currentCellText += text;
+    return;
+  }
+
   const startIndex = context.currentIndex;
   const endIndex = startIndex + text.length;
 
-  // Insert the text
   insertText(text, context);
 
-  // Track formatting for this range
   const currentFormatting = mergeFormattingStack(context.formattingStack);
   if (hasFormatting(currentFormatting)) {
     context.textRanges.push({
@@ -392,7 +579,6 @@ function hasFormatting(formatting: FormattingState): boolean {
 }
 
 function popFormatting(context: ConversionContext, type: keyof FormattingState): void {
-  // Find and remove the last formatting state with this type
   for (let i = context.formattingStack.length - 1; i >= 0; i--) {
     if (context.formattingStack[i][type] !== undefined) {
       context.formattingStack.splice(i, 1);
@@ -404,17 +590,7 @@ function popFormatting(context: ConversionContext, type: keyof FormattingState):
 // --- Finalization ---
 
 function finalizeFormatting(context: ConversionContext): void {
-  // Apply character-level formatting
   for (const range of context.textRanges) {
-    const rangeLocation: docs_v1.Schema$Range = {
-      startIndex: range.startIndex,
-      endIndex: range.endIndex
-    };
-    if (context.tabId) {
-      rangeLocation.tabId = context.tabId;
-    }
-
-    // Apply text style (bold, italic, strikethrough)
     if (range.formatting.bold || range.formatting.italic || range.formatting.strikethrough) {
       const styleRequest = buildUpdateTextStyleRequest(
         range.startIndex,
@@ -431,7 +607,6 @@ function finalizeFormatting(context: ConversionContext): void {
       }
     }
 
-    // Apply link separately
     if (range.formatting.link) {
       const linkRequest = buildUpdateTextStyleRequest(
         range.startIndex,
@@ -445,7 +620,6 @@ function finalizeFormatting(context: ConversionContext): void {
     }
   }
 
-  // Apply paragraph-level formatting (headings)
   for (const paraRange of context.paragraphRanges) {
     if (paraRange.namedStyleType) {
       const paraRequest = buildUpdateParagraphStyleRequest(
@@ -460,7 +634,6 @@ function finalizeFormatting(context: ConversionContext): void {
     }
   }
 
-  // Apply list formatting
   for (const listItem of context.pendingListItems) {
     if (listItem.endIndex !== undefined) {
       const rangeLocation: docs_v1.Schema$Range = {
@@ -479,8 +652,6 @@ function finalizeFormatting(context: ConversionContext): void {
         createParagraphBullets: {
           range: rangeLocation,
           bulletPreset,
-          // Note: Google Docs API automatically manages nesting levels
-          // We include nestingLevel but the API may adjust it
         }
       });
     }
