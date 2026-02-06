@@ -36,8 +36,8 @@ All tools are MCP tools called via the standard tool interface (not HTTP). The `
 | `insertText` | Insert text at index | `documentId`, `text`, `index` |
 | `appendToGoogleDoc` | Append text to end | `documentId`, `text` |
 | `deleteRange` | Delete content range | `documentId`, `startIndex`, `endIndex` |
-| `replaceDocumentWithMarkdown` | Replace entire doc with markdown | `documentId`, `markdown` |
-| `appendMarkdownToGoogleDoc` | Append markdown to end | `documentId`, `markdown` |
+| `replaceDocumentWithMarkdown` | Replace entire doc with Markdown | `documentId`, `markdown` |
+| `appendMarkdownToGoogleDoc` | Append Markdown to end | `documentId`, `markdown` |
 
 ### 3. Formatting
 
@@ -55,7 +55,7 @@ All tools are MCP tools called via the standard tool interface (not HTTP). The `
 | `insertTable` | Create new table | `documentId`, `rows`, `columns`, `index` |
 | `editTableCell` | Replace text in one cell | `documentId`, `tableIndex`, `row`, `col`, `text` |
 | `batchEditTableCells` | Bulk edit up to 500 cells | `documentId`, `tableIndex`, `edits[]` |
-| `fillTableFromData` | Fill table from 2D string array | `documentId`, `tableIndex`, `data[][]` |
+| `fillTableFromData` | Fill table from 2D string array | `documentId`, `tableIndex`, `data[][]`, `startRow?`, `startCol?`, `skipEmpty?` |
 | `batchEditTableCellsFormatted` | Write cells with per-run formatting | `documentId`, `tableIndex`, `cells[]` with `runs[]` |
 | `insertImageInTableCell` | Image in cell with optional size | `documentId`, `tableIndex`, `row`, `col`, `imageUrl`, `width?`, `height?` |
 | `batchInsertImagesInTable` | Batch insert up to 50 images | `documentId`, `tableIndex`, `images[]` |

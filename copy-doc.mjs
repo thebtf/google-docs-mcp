@@ -11,8 +11,11 @@ import { authorize } from './dist/auth.js';
 import * as GDocsHelpers from './dist/googleDocsApiHelpers.js';
 import * as TableHelpers from './dist/tableHelpers.js';
 
-const REF_DOC_ID = '1HNA3gfAuc1a9HwYkd1am-nbYVOXcL_xSHdMzMIHwPPU';
-const TEST_DOC_ID = '1rE98KjYCWnlIge9oPWQuxQXPQfDBcuMahDY5_kyhOrc';
+const REF_DOC_ID = process.env.REF_DOC_ID;
+const TEST_DOC_ID = process.env.TEST_DOC_ID;
+if (!REF_DOC_ID || !TEST_DOC_ID) {
+  throw new Error('Set REF_DOC_ID and TEST_DOC_ID env vars before running copy-doc.mjs');
+}
 
 const log = {
   info: (msg) => console.log('[INFO]', msg),
@@ -119,6 +122,7 @@ async function getInsertionPoint(docs) {
 function extractParagraphRuns(paragraph, inlineObjects) {
   const runs = [];
   const imageInfo = [];
+  let textOffset = 0;
 
   if (!paragraph.elements) return { runs, imageInfo };
 
@@ -136,6 +140,7 @@ function extractParagraphRuns(paragraph, inlineObjects) {
             uri,
             width: size?.width?.magnitude,
             height: size?.height?.magnitude,
+            offset: textOffset,
           });
         }
       }
@@ -177,6 +182,7 @@ function extractParagraphRuns(paragraph, inlineObjects) {
       }
 
       runs.push({ text: content, ...(hasStyle ? { style } : {}) });
+      textOffset += content.length;
     }
   }
 
@@ -230,6 +236,7 @@ async function copyParagraphBatch(docs, paragraphElements, inlineObjects) {
 
   for (const pd of paraData) {
     const paraStart = offset;
+    pd.startIndex = paraStart; // Store for image insertion
     const paraTextLen = pd.fullText.length;
     const paraEnd = offset + paraTextLen + 1; // +1 for \n
 
@@ -264,32 +271,36 @@ async function copyParagraphBatch(docs, paragraphElements, inlineObjects) {
 
   log.info(`  Copied ${paraData.length} paragraphs (${allText.length} chars, ${formatRequests.length} format ops)`);
 
-  // Phase 3: Insert images
-  const imagesNeeded = paraData.filter(p => p.imageInfo.length > 0);
-  if (imagesNeeded.length > 0) {
-    // For images we need to re-read doc and insert at correct positions
-    // For now, insert images sequentially as they need accurate positions
-    for (const pd of imagesNeeded) {
-      for (const img of pd.imageInfo) {
-        try {
-          const imgPoint = await getInsertionPoint(docs);
-          const req = {
-            insertInlineImage: {
-              location: { index: imgPoint },
-              uri: img.uri,
-              ...(img.width && img.height && {
-                objectSize: {
-                  height: { magnitude: img.height, unit: 'PT' },
-                  width: { magnitude: img.width, unit: 'PT' },
-                },
-              }),
-            }
-          };
-          await GDocsHelpers.executeBatchUpdate(docs, TEST_DOC_ID, [req]);
-          log.info(`  Inserted image: ${img.uri.substring(0, 60)}... (${img.width || '?'}x${img.height || '?'}pt)`);
-        } catch (e) {
-          log.error(`  Failed to insert image ${img.uri.substring(0, 60)}: ${e.message}`);
-        }
+  // Phase 3: Insert images at correct positions
+  const imageInserts = [];
+  for (const pd of paraData) {
+    for (const img of pd.imageInfo) {
+      imageInserts.push({ ...img, index: pd.startIndex + img.offset });
+    }
+  }
+
+  if (imageInserts.length > 0) {
+    // Sort in reverse order to avoid shifting subsequent indices
+    imageInserts.sort((a, b) => b.index - a.index);
+
+    for (const img of imageInserts) {
+      try {
+        const req = {
+          insertInlineImage: {
+            location: { index: img.index },
+            uri: img.uri,
+            ...(img.width && img.height && {
+              objectSize: {
+                height: { magnitude: img.height, unit: 'PT' },
+                width: { magnitude: img.width, unit: 'PT' },
+              },
+            }),
+          }
+        };
+        await GDocsHelpers.executeBatchUpdate(docs, TEST_DOC_ID, [req]);
+        log.info(`  Inserted image at index ${img.index}: ${img.uri.substring(0, 60)}... (${img.width || '?'}x${img.height || '?'}pt)`);
+      } catch (e) {
+        log.error(`  Failed to insert image ${img.uri.substring(0, 60)}: ${e.message}`);
       }
     }
   }

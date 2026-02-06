@@ -693,13 +693,23 @@ async function fillPendingTables(
   docs: docs_v1.Docs,
   documentId: string,
   pendingFills: PendingTableFill[],
+  tabId?: string,
   log?: { info: (msg: string) => void }
 ): Promise<void> {
   // Re-read the document to get actual table positions
-  const res = await docs.documents.get({ documentId });
-  if (!res.data.body?.content) return;
+  const res = await docs.documents.get({
+    documentId,
+    includeTabsContent: !!tabId,
+  });
 
-  const tables = TableHelpers.extractTableElements(res.data.body.content);
+  let bodyContent = res.data.body?.content;
+  if (tabId) {
+    const tab = GDocsHelpers.findTabById(res.data, tabId);
+    bodyContent = tab?.documentTab?.body?.content;
+  }
+  if (!bodyContent) return;
+
+  const tables = TableHelpers.extractTableElements(bodyContent);
 
   for (const fill of pendingFills) {
     // Find the table that was inserted at/near fill.insertIndex
@@ -729,7 +739,7 @@ async function fillPendingTables(
     if (edits.length === 0) continue;
 
     const requests = TableHelpers.buildBatchEditCellRequests(
-      res.data.body.content,
+      bodyContent,
       tableIndex,
       edits,
     );
@@ -740,8 +750,15 @@ async function fillPendingTables(
 
     // Bold header row if applicable — must re-read document after cell fill
     if (fill.hasBoldHeaders) {
-      const doc2 = await docs.documents.get({ documentId });
-      const body2 = doc2.data.body?.content;
+      const doc2 = await docs.documents.get({
+        documentId,
+        includeTabsContent: !!tabId,
+      });
+      let body2 = doc2.data.body?.content;
+      if (tabId) {
+        const tab2 = GDocsHelpers.findTabById(doc2.data, tabId);
+        body2 = tab2?.documentTab?.body?.content;
+      }
       if (body2) {
         const tables2 = TableHelpers.extractTableElements(body2);
         const tbl2 = tables2[tableIndex];
@@ -763,7 +780,7 @@ async function fillPendingTables(
             }
           }
           if (boldRequests.length > 0) {
-            await GDocsHelpers.executeBatchUpdate(docs, documentId, boldRequests);
+            await GDocsHelpers.executeBatchUpdateChunked(docs, documentId, boldRequests, 50, log);
             if (log) log.info(`Bolded ${boldRequests.length} header cells`);
           }
         }
@@ -809,14 +826,21 @@ async function executeMarkdownWithTables(
 
   // Fill table cells
   if (pendingTableFills.length > 0) {
-    await fillPendingTables(docs, documentId, pendingTableFills, log);
+    await fillPendingTables(docs, documentId, pendingTableFills, tabId, log);
   }
 
   // If there's remaining content after the table, append it
   if (postTableContent) {
     // Re-read document to find current end index
-    const doc2 = await docs.documents.get({ documentId });
-    const body2 = doc2.data.body?.content;
+    const doc2 = await docs.documents.get({
+      documentId,
+      includeTabsContent: !!tabId,
+    });
+    let body2 = doc2.data.body?.content;
+    if (tabId) {
+      const tab2 = GDocsHelpers.findTabById(doc2.data, tabId);
+      body2 = tab2?.documentTab?.body?.content;
+    }
     if (body2 && body2.length > 0) {
       const newEndIndex = body2[body2.length - 1].endIndex! - 1;
       log.info(`Appending post-table content at index ${newEndIndex}`);

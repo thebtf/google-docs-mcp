@@ -57,7 +57,7 @@ function generateId(): string {
 
 export interface ParagraphContent {
   runs: FormattedRun[];
-  imageInfo: ImageInfo[];
+  imageInfo: Array<ImageInfo & { offset: number }>;
   namedStyle?: string;
 }
 
@@ -70,7 +70,8 @@ export function extractParagraphFormattedContent(
   inlineObjects: Record<string, docs_v1.Schema$InlineObject>
 ): ParagraphContent {
   const runs: FormattedRun[] = [];
-  const imageInfo: ImageInfo[] = [];
+  const imageInfo: Array<ImageInfo & { offset: number }> = [];
+  let textOffset = 0;
 
   if (!paragraph.elements) return { runs, imageInfo };
 
@@ -89,6 +90,7 @@ export function extractParagraphFormattedContent(
             uri,
             width: size?.width?.magnitude ?? undefined,
             height: size?.height?.magnitude ?? undefined,
+            offset: textOffset,
           });
         }
       }
@@ -131,6 +133,7 @@ export function extractParagraphFormattedContent(
       }
 
       runs.push({ text: content, ...(hasStyle ? { style } : {}) });
+      textOffset += content.length;
     }
   }
 
@@ -251,8 +254,12 @@ async function restoreParagraphBatch(
   const paraStyleRequests: docs_v1.Schema$Request[] = [];
   let offset = insertPoint;
 
+  // Store startIndex for each paragraph to compute image positions later
+  const paraDataWithIndex: Array<ParagraphContent & { startIndex: number }> = [];
+
   for (const pd of paraData) {
     const paraStart = offset;
+    paraDataWithIndex.push({ ...pd, startIndex: paraStart });
     const paraTextLen = pd.runs.map(r => r.text).join('').length;
     const paraEnd = offset + paraTextLen + 1; // +1 for \n
 
@@ -286,29 +293,35 @@ async function restoreParagraphBatch(
     await executeBatchUpdateChunked(docs, documentId, allRequests, 50, log);
   }
 
-  // Phase 3: Insert images
-  const imagesNeeded = paraData.filter(p => p.imageInfo.length > 0);
-  if (imagesNeeded.length > 0) {
-    for (const pd of imagesNeeded) {
-      for (const img of pd.imageInfo) {
-        try {
-          const imgPoint = await getInsertionPoint(docs, documentId);
-          const req: docs_v1.Schema$Request = {
-            insertInlineImage: {
-              location: { index: imgPoint },
-              uri: img.uri,
-              ...(img.width && img.height && {
-                objectSize: {
-                  height: { magnitude: img.height, unit: 'PT' },
-                  width: { magnitude: img.width, unit: 'PT' },
-                },
-              }),
-            }
-          };
-          await executeBatchUpdate(docs, documentId, [req]);
-        } catch {
-          // Image insertion can fail if URI expired — continue with rest
-        }
+  // Phase 3: Insert images at correct positions
+  const imageInserts: Array<ImageInfo & { offset: number; index: number }> = [];
+  for (const pd of paraDataWithIndex) {
+    for (const img of pd.imageInfo) {
+      imageInserts.push({ ...img, index: pd.startIndex + img.offset });
+    }
+  }
+
+  if (imageInserts.length > 0) {
+    // Sort in reverse order to avoid shifting subsequent indices
+    imageInserts.sort((a, b) => b.index - a.index);
+
+    for (const img of imageInserts) {
+      try {
+        const req: docs_v1.Schema$Request = {
+          insertInlineImage: {
+            location: { index: img.index },
+            uri: img.uri,
+            ...(img.width && img.height && {
+              objectSize: {
+                height: { magnitude: img.height, unit: 'PT' },
+                width: { magnitude: img.width, unit: 'PT' },
+              },
+            }),
+          }
+        };
+        await executeBatchUpdate(docs, documentId, [req]);
+      } catch {
+        // Image insertion can fail if URI expired — continue with rest
       }
     }
   }

@@ -138,7 +138,9 @@ export async function executeBatchUpdateWithSplitting(
 /**
  * Executes a pre-sorted array of requests in chunks without re-fetching the document.
  * Requests MUST already be sorted in correct execution order (typically descending index).
- * Groups are preserved: consecutive requests belonging to the same cell edit are never split.
+ *
+ * NOTE: Request groups are not automatically recognized — if they cannot be split,
+ *       group them before calling this function.
  *
  * @param docs - Google Docs API client
  * @param documentId - Document ID
@@ -155,6 +157,9 @@ export async function executeBatchUpdateChunked(
     log?: { info: (msg: string) => void }
 ): Promise<number> {
     if (!requests || requests.length === 0) return 0;
+    if (!Number.isInteger(chunkSize) || chunkSize <= 0) {
+        throw new UserError(`chunkSize must be a positive integer (got ${chunkSize})`);
+    }
 
     let apiCalls = 0;
     for (let i = 0; i < requests.length; i += chunkSize) {
