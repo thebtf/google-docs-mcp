@@ -406,7 +406,7 @@ async function restoreTable(
       for (const cd of cellsWithFormatting) {
         const targetCell = getCellElement(targetTable, cd.row, cd.col);
         const cellStart = getCellInsertionPoint(targetCell);
-        const cellFormatReqs = buildFormattedCellFormatRequests(cellStart, cd.runs);
+        const cellFormatReqs = buildFormattedCellFormatRequests(cellStart, cd.runs, undefined);
         formatRequests.push(...cellFormatReqs);
       }
       if (formatRequests.length > 0) {

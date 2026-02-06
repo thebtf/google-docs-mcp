@@ -437,7 +437,7 @@ export function buildBatchEditCellRequests(
       if (edit.text) {
         requests.push({
           insertText: {
-            location: { index: insertPoint, ...(tabId && { segmentId: tabId }) },
+            location: { index: insertPoint, ...(tabId && { tabId }) },
             text: edit.text,
           },
         });
@@ -451,7 +451,7 @@ export function buildBatchEditCellRequests(
     for (const range of sortedRanges) {
       requests.push({
         deleteContentRange: {
-          range: { startIndex: range.startIndex, endIndex: range.endIndex, ...(tabId && { segmentId: tabId }) },
+          range: { startIndex: range.startIndex, endIndex: range.endIndex, ...(tabId && { tabId }) },
         },
       });
     }
@@ -461,7 +461,7 @@ export function buildBatchEditCellRequests(
     if (edit.text) {
       requests.push({
         insertText: {
-          location: { index: insertPoint, ...(tabId && { segmentId: tabId }) },
+          location: { index: insertPoint, ...(tabId && { tabId }) },
           text: edit.text,
         },
       });
@@ -504,9 +504,9 @@ export function buildBatchInsertImageRequests(
 
     const request: docs_v1.Schema$Request = {
       insertInlineImage: {
-        location: { index: insertPoint, ...(tabId && { segmentId: tabId }) },
+        location: { index: insertPoint, ...(tabId && { tabId }) },
         uri: img.imageUrl,
-        ...(img.width && img.height && {
+        ...(img.width != null && img.height != null && {
           objectSize: {
             height: { magnitude: img.height, unit: 'PT' },
             width: { magnitude: img.width, unit: 'PT' },

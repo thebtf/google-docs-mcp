@@ -844,7 +844,12 @@ async function executeMarkdownWithTables(
       body2 = tab2?.documentTab?.body?.content;
     }
     if (body2 && body2.length > 0) {
-      const newEndIndex = body2[body2.length - 1].endIndex! - 1;
+      const lastEndIndex = body2[body2.length - 1].endIndex;
+      if (lastEndIndex == null) {
+        log.info('Warning: could not determine end index for post-table content');
+        return { totalOps, totalTables };
+      }
+      const newEndIndex = lastEndIndex - 1;
       log.info(`Appending post-table content at index ${newEndIndex}`);
 
       const sub = await executeMarkdownWithTables(
@@ -1593,7 +1598,7 @@ execute: async (args, { log }) => {
     if (!res.data.body?.content) {
       throw new UserError('Document has no content.');
     }
-    const inlineObjects = (res.data as any).inlineObjects || {};
+    const inlineObjects = res.data.inlineObjects ?? {};
     const result = TableHelpers.readTableCellsFormatted(
       res.data.body.content,
       args.tableIndex,
@@ -1632,10 +1637,12 @@ parameters: DocumentIdParameter.extend({
       }).optional().describe('Text style for this run. Omit for default formatting.'),
     })).min(1).describe('Array of text runs with optional per-run formatting.'),
   })).min(1).max(100).describe('Array of formatted cell edits.'),
+  tabId: z.string().optional().describe('Optional tab ID for multi-tab documents.'),
 }),
 execute: async (args, { log }) => {
   const docs = await getDocsClient();
   log.info(`Batch editing ${args.cells.length} formatted cells in table ${args.tableIndex}, doc ${args.documentId}`);
+  // TODO: Add tabId support for multi-tab documents (currently assumes first/default tab)
   try {
     // Phase 1: Insert text (concatenate runs per cell)
     let res = await docs.documents.get({ documentId: args.documentId });
@@ -1653,6 +1660,7 @@ execute: async (args, { log }) => {
       res.data.body.content,
       args.tableIndex,
       textEdits,
+      args.tabId,
     );
 
     let apiCalls = 0;
@@ -1677,7 +1685,7 @@ execute: async (args, { log }) => {
       for (const c of cellsWithFormatting) {
         const targetCell = TableHelpers.getCellElement(table, c.row, c.col);
         const cellStart = TableHelpers.getCellInsertionPoint(targetCell);
-        const cellFormatReqs = TableHelpers.buildFormattedCellFormatRequests(cellStart, c.runs as TableHelpers.FormattedRun[]);
+        const cellFormatReqs = TableHelpers.buildFormattedCellFormatRequests(cellStart, c.runs as TableHelpers.FormattedRun[], args.tabId);
         formatRequests.push(...cellFormatReqs);
       }
 
