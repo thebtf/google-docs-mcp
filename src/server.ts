@@ -742,6 +742,7 @@ async function fillPendingTables(
       bodyContent,
       tableIndex,
       edits,
+      tabId,
     );
 
     if (requests.length > 0) {
@@ -771,7 +772,8 @@ async function fillPendingTables(
                 const styleResult = GDocsHelpers.buildUpdateTextStyleRequest(
                   range.startIndex,
                   range.endIndex - 1,
-                  { bold: true }
+                  { bold: true },
+                  tabId
                 );
                 if (styleResult) {
                   boldRequests.push(styleResult.request);

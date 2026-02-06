@@ -418,6 +418,7 @@ export function buildBatchEditCellRequests(
   bodyContent: docs_v1.Schema$StructuralElement[],
   tableIndex: number,
   edits: CellEdit[],
+  tabId?: string,
 ): docs_v1.Schema$Request[] {
   const tableEl = getTableElement(bodyContent, tableIndex);
   const table = tableEl.table!;
@@ -436,7 +437,7 @@ export function buildBatchEditCellRequests(
       if (edit.text) {
         requests.push({
           insertText: {
-            location: { index: insertPoint },
+            location: { index: insertPoint, ...(tabId && { segmentId: tabId }) },
             text: edit.text,
           },
         });
@@ -450,7 +451,7 @@ export function buildBatchEditCellRequests(
     for (const range of sortedRanges) {
       requests.push({
         deleteContentRange: {
-          range: { startIndex: range.startIndex, endIndex: range.endIndex },
+          range: { startIndex: range.startIndex, endIndex: range.endIndex, ...(tabId && { segmentId: tabId }) },
         },
       });
     }
@@ -460,7 +461,7 @@ export function buildBatchEditCellRequests(
     if (edit.text) {
       requests.push({
         insertText: {
-          location: { index: insertPoint },
+          location: { index: insertPoint, ...(tabId && { segmentId: tabId }) },
           text: edit.text,
         },
       });
@@ -490,6 +491,7 @@ export function buildBatchInsertImageRequests(
   bodyContent: docs_v1.Schema$StructuralElement[],
   tableIndex: number,
   images: CellImageInsert[],
+  tabId?: string,
 ): docs_v1.Schema$Request[] {
   const tableEl = getTableElement(bodyContent, tableIndex);
   const table = tableEl.table!;
@@ -502,7 +504,7 @@ export function buildBatchInsertImageRequests(
 
     const request: docs_v1.Schema$Request = {
       insertInlineImage: {
-        location: { index: insertPoint },
+        location: { index: insertPoint, ...(tabId && { segmentId: tabId }) },
         uri: img.imageUrl,
         ...(img.width && img.height && {
           objectSize: {
