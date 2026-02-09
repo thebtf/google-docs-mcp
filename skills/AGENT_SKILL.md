@@ -36,6 +36,7 @@ All tools are MCP tools called via the standard tool interface (not HTTP). The `
 | `insertText` | Insert text at index | `documentId`, `text`, `index` |
 | `appendToGoogleDoc` | Append text to end | `documentId`, `text` |
 | `deleteRange` | Delete content range | `documentId`, `startIndex`, `endIndex` |
+| `replaceText` | Find and replace all occurrences (no indices needed) | `documentId`, `searchText`, `replaceText`, `matchCase?` |
 | `replaceDocumentWithMarkdown` | Replace entire doc with Markdown | `documentId`, `markdown` |
 | `appendMarkdownToGoogleDoc` | Append Markdown to end | `documentId`, `markdown` |
 
@@ -61,6 +62,7 @@ All tools are MCP tools called via the standard tool interface (not HTTP). The `
 | `batchInsertImagesInTable` | Batch insert up to 50 images | `documentId`, `tableIndex`, `images[]` |
 | `findTableRow` | Search rows by column content | `documentId`, `tableIndex`, `searchColumn`, `searchText` |
 | `addTableRow` | Insert row after index | `documentId`, `tableIndex`, `insertBelow` |
+| `updateTableCellStyle` | Set cell padding, alignment, background | `documentId`, `tableIndex`, `padding?`, `contentAlignment?`, `backgroundColor?`, `startRow?`, `colSpan?` |
 
 ### 5. Undo/Redo Snapshots
 

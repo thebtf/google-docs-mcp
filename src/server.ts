@@ -683,6 +683,42 @@ try {
 }
 });
 
+server.addTool({
+name: 'replaceText',
+description: 'Find and replace text in a document. Replaces ALL occurrences of the search text. Does NOT require knowing text indices — works by content matching. Case-sensitive by default. Use this instead of deleteRange+insertText when you need to update existing text.',
+parameters: DocumentIdParameter.extend({
+  searchText: z.string().min(1).describe('The text to find (exact match).'),
+  replaceText: z.string().describe('The replacement text (can be empty string to delete matches).'),
+  matchCase: z.boolean().optional().default(true).describe('Whether to match case (default: true).'),
+}),
+execute: async (args, { log }) => {
+  const docs = await getDocsClient();
+  log.info(`Replacing "${args.searchText}" with "${args.replaceText}" in doc ${args.documentId}`);
+  try {
+    const request: docs_v1.Schema$Request = {
+      replaceAllText: {
+        containsText: {
+          text: args.searchText,
+          matchCase: args.matchCase,
+        },
+        replaceText: args.replaceText,
+      },
+    };
+    const result = await GDocsHelpers.executeBatchUpdate(docs, args.documentId, [request]);
+    const count = result.replies?.[0]?.replaceAllText?.occurrencesChanged ?? 0;
+    if (count === 0) {
+      return `No occurrences of "${args.searchText}" found in the document.`;
+    }
+    return `Replaced ${count} occurrence(s) of "${args.searchText}" with "${args.replaceText}".`;
+  } catch (error: any) {
+    log.error(`Error replacing text: ${error.message || error}`);
+    if (error instanceof UserError) throw error;
+    if (error.code === 404) throw new UserError(`Document not found (ID: ${args.documentId}).`);
+    throw new UserError(`Failed to replace text: ${error.message || 'Unknown error'}`);
+  }
+}
+});
+
 // --- Markdown Table Fill Helper ---
 
 /**
