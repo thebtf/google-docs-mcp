@@ -5,7 +5,7 @@
 import { docs_v1 } from 'googleapis';
 import { UserError } from 'fastmcp';
 import { TextStyleArgs } from './types.js';
-import { buildUpdateTextStyleRequest, executeBatchUpdate, executeBatchUpdateChunked } from './googleDocsApiHelpers.js';
+import { buildUpdateTextStyleRequest, buildObjectSize, executeBatchUpdate, executeBatchUpdateChunked } from './googleDocsApiHelpers.js';
 import {
   extractTableElements,
   extractFormattedCellContent,
@@ -313,12 +313,7 @@ async function restoreParagraphBatch(
           insertInlineImage: {
             location: { index: img.index },
             uri: img.uri,
-            ...(img.width != null && img.height != null && {
-              objectSize: {
-                height: { magnitude: img.height, unit: 'PT' },
-                width: { magnitude: img.width, unit: 'PT' },
-              },
-            }),
+            ...buildObjectSize(img.width, img.height),
           }
         };
         await executeBatchUpdate(docs, documentId, [req]);

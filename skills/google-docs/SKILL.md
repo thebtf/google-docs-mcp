@@ -36,6 +36,7 @@ All tools are MCP tools called via the standard tool interface (not HTTP). The `
 | `insertText` | Insert text at index | `documentId`, `text`, `index` |
 | `appendToGoogleDoc` | Append text to end | `documentId`, `text` |
 | `deleteRange` | Delete content range | `documentId`, `startIndex`, `endIndex` |
+| `replaceText` | Find and replace all occurrences (no indices needed) | `documentId`, `searchText`, `replaceText`, `matchCase?` |
 | `replaceDocumentWithMarkdown` | Replace entire doc with Markdown | `documentId`, `markdown` |
 | `appendMarkdownToGoogleDoc` | Append Markdown to end | `documentId`, `markdown` |
 
@@ -53,14 +54,15 @@ All tools are MCP tools called via the standard tool interface (not HTTP). The `
 | Tool | Purpose | Key Params |
 |------|---------|------------|
 | `insertTable` | Create new table | `documentId`, `rows`, `columns`, `index` |
-| `editTableCell` | Replace text in one cell | `documentId`, `tableIndex`, `row`, `col`, `text` |
+| `editTableCell` | Replace text in one cell | `documentId`, `tableIndex`, `rowIndex`, `columnIndex`, `newText` |
 | `batchEditTableCells` | Bulk edit up to 500 cells | `documentId`, `tableIndex`, `edits[]` |
 | `fillTableFromData` | Fill table from 2D string array | `documentId`, `tableIndex`, `data[][]`, `startRow?`, `startCol?`, `skipEmpty?` |
 | `batchEditTableCellsFormatted` | Write cells with per-run formatting | `documentId`, `tableIndex`, `cells[]` with `runs[]` |
-| `insertImageInTableCell` | Image in cell with optional size | `documentId`, `tableIndex`, `row`, `col`, `imageUrl`, `width?`, `height?` |
+| `insertImageInTableCell` | Image in cell with optional size | `documentId`, `tableIndex`, `rowIndex`, `columnIndex`, `imageUrl`, `width?`, `height?` |
 | `batchInsertImagesInTable` | Batch insert up to 50 images | `documentId`, `tableIndex`, `images[]` |
 | `findTableRow` | Search rows by column content | `documentId`, `tableIndex`, `searchColumn`, `searchText` |
 | `addTableRow` | Insert row after index | `documentId`, `tableIndex`, `insertBelow` |
+| `updateTableCellStyle` | Set cell padding, alignment, background | `documentId`, `tableIndex`, `padding?`, `contentAlignment?`, `backgroundColor?`, `startRow?`, `colSpan?` |
 
 ### 5. Undo/Redo Snapshots
 
@@ -226,6 +228,42 @@ For formatted content:
 | "Permission denied (403)" | No edit access | Check sharing settings |
 | "No snapshots available" | No prior `createDocumentSnapshot` | Always snapshot before destructive ops |
 | "Invalid request (400)" | Stale indices after edit | Re-read document to get fresh indices |
+| "missing tool result" | Transient error (rate limit/timeout) | **DO NOT retry** — report to user |
+| Google API 429 | Rate limit exceeded | Server retries automatically (3x with backoff) |
+
+---
+
+## Agent Best Practices
+
+### Error Handling Rules
+
+1. **Max 2 retries per tool call.** If a tool call fails twice, stop and report the error to the user. Do NOT enter a retry loop.
+2. **"missing tool result" = STOP.** This means the tool result was lost due to a transient error. Do not call the same tool again — inform the user.
+3. **Distinguish error types:**
+   - 400/403/404 = permanent error, fix the input
+   - 429/500/503 = transient, the MCP server retries automatically (3 attempts with exponential backoff)
+   - If the server's internal retries fail, you get the error — do NOT add your own retry loop on top
+
+### Efficient Table Operations
+
+For large tables (20+ rows):
+1. **Read structure first:** `getTableStructure` → note row/column counts
+2. **Plan edits before reading:** Decide which rows/columns you need. Don't read the entire table if you only need a few cells.
+3. **Batch edits:** Collect all cell changes, then use ONE `batchEditTableCells` or `fillTableFromData` call. Avoid calling `editTableCell` in a loop for multiple cells.
+4. **Minimize API roundtrips:** Each tool call = 1+ Google API calls. Fewer calls = less chance of rate limits.
+
+### Rate Limit Awareness
+
+- Google Docs API: ~10 requests/second per user
+- The server auto-retries 429 errors with exponential backoff (1s → 2s → 4s, max 30s)
+- If you're editing a large table: combine operations into batch calls
+- Between large batch operations, the server handles delays internally
+
+### Multi-Tab Documents
+
+- Pass `tabId` parameter to `batchEditTableCellsFormatted` for multi-tab documents
+- Get tab IDs with `listDocumentTabs` first
+- If `tabId` is omitted, the default (first) tab is used
 
 ---
 
@@ -241,7 +279,7 @@ readGoogleDoc(documentId="1abc...", outputFormat="markdown")
 getTableStructure(documentId="1abc...")
 → Table 0: 10 rows x 5 cols
 
-editTableCell(documentId="1abc...", tableIndex=0, row=3, col=2, text="Updated value")
+editTableCell(documentId="1abc...", tableIndex=0, rowIndex=3, columnIndex=2, newText="Updated value")
 ```
 
 ### Bulk populate a table

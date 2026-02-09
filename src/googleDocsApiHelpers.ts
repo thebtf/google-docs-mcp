@@ -8,42 +8,124 @@ type Docs = docs_v1.Docs; // Alias for convenience
 
 // --- Constants ---
 const MAX_BATCH_UPDATE_REQUESTS = 50; // Google API limits batch size
+const RETRY_MAX_ATTEMPTS = 3;
+const RETRY_BASE_DELAY_MS = 1000;
+const RETRY_MAX_DELAY_MS = 30000;
+
+// --- objectSize helper (supports width-only, height-only, or both) ---
+
+/**
+ * Build an objectSize spread for insertInlineImage requests.
+ * Google Docs API accepts width-only or height-only — the missing
+ * dimension is calculated to preserve aspect ratio.
+ */
+export function buildObjectSize(
+    width?: number,
+    height?: number,
+): { objectSize: docs_v1.Schema$Size } | Record<string, never> {
+    if (width == null && height == null) return {};
+    const objectSize: docs_v1.Schema$Size = {};
+    if (width != null) objectSize.width = { magnitude: width, unit: 'PT' };
+    if (height != null) objectSize.height = { magnitude: height, unit: 'PT' };
+    return { objectSize };
+}
+
+// --- Retry Helper for Transient Google API and Network Errors ---
+const RETRYABLE_NETWORK_CODES = new Set([
+    'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'EPIPE', 'EHOSTUNREACH',
+]);
+
+async function retryWithBackoff<T>(
+    fn: () => Promise<T>,
+    label: string,
+): Promise<T> {
+    let lastError: any;
+    for (let attempt = 0; attempt <= RETRY_MAX_ATTEMPTS; attempt++) {
+        try {
+            return await fn();
+        } catch (error: any) {
+            lastError = error;
+            if (attempt === RETRY_MAX_ATTEMPTS) {
+                // Last attempt failed, break out of the loop to throw.
+                break;
+            }
+
+            const httpCode = error.code ?? error.response?.status;
+            const isHttpTransient = httpCode === 429 || httpCode === 500 || httpCode === 503;
+            const isNetworkTransient = typeof error.code === 'string' && RETRYABLE_NETWORK_CODES.has(error.code);
+
+            if (isHttpTransient || isNetworkTransient) {
+                const retryAfterHeader = error.response?.headers?.['retry-after'];
+                const retryAfterMs = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : 0;
+                const exponentialDelay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+                const jitter = Math.random() * 1000;
+                const delay = Math.min(
+                    Math.max(retryAfterMs, exponentialDelay) + jitter,
+                    RETRY_MAX_DELAY_MS,
+                );
+                const reason = isNetworkTransient ? error.code : `HTTP ${httpCode}`;
+                console.warn(
+                    `[${label}] ${reason}, retrying in ${Math.round(delay)}ms ` +
+                    `(retry ${attempt + 1} of ${RETRY_MAX_ATTEMPTS})`,
+                );
+                await new Promise(resolve => setTimeout(resolve, delay));
+            } else {
+                // Not a retryable error, throw immediately.
+                throw error;
+            }
+        }
+    }
+    throw lastError;
+}
+
+// --- Wrapper for docs.documents.get with retry ---
+export async function getDocumentWithRetry(
+    docs: Docs,
+    documentId: string,
+    fields?: string,
+): Promise<docs_v1.Schema$Document> {
+    return retryWithBackoff(async () => {
+        const params: any = { documentId };
+        if (fields) params.fields = fields;
+        const res = await docs.documents.get(params);
+        return res.data;
+    }, `getDocument(${documentId.slice(0, 8)}…)`);
+}
 
 // --- Core Helper to Execute Batch Updates ---
 export async function executeBatchUpdate(docs: Docs, documentId: string, requests: docs_v1.Schema$Request[]): Promise<docs_v1.Schema$BatchUpdateDocumentResponse> {
 if (!requests || requests.length === 0) {
-// console.warn("executeBatchUpdate called with no requests.");
 return {}; // Nothing to do
 }
 
-    // TODO: Consider splitting large request arrays into multiple batches if needed
     if (requests.length > MAX_BATCH_UPDATE_REQUESTS) {
          console.warn(`Attempting batch update with ${requests.length} requests, exceeding typical limits. May fail.`);
     }
 
-    try {
-        const response = await docs.documents.batchUpdate({
-            documentId: documentId,
-            requestBody: { requests },
-        });
-        return response.data;
-    } catch (error: any) {
-        console.error(`Google API batchUpdate Error for doc ${documentId}:`, error.response?.data || error.message);
-        // Translate common API errors to UserErrors
-        if (error.code === 400 && error.message.includes('Invalid requests')) {
-             // Try to extract more specific info if available
-             const details = error.response?.data?.error?.details;
-             let detailMsg = '';
-             if (details && Array.isArray(details)) {
-                 detailMsg = details.map(d => d.description || JSON.stringify(d)).join('; ');
-             }
-            throw new UserError(`Invalid request sent to Google Docs API. Details: ${detailMsg || error.message}`);
+    return retryWithBackoff(async () => {
+        try {
+            const response = await docs.documents.batchUpdate({
+                documentId: documentId,
+                requestBody: { requests },
+            });
+            return response.data;
+        } catch (error: any) {
+            console.error(`Google API batchUpdate Error for doc ${documentId}:`, error.response?.data || error.message);
+            // Non-retryable errors: translate to UserErrors
+            if (error.code === 400 && error.message.includes('Invalid requests')) {
+                const details = error.response?.data?.error?.details;
+                let detailMsg = '';
+                if (details && Array.isArray(details)) {
+                    detailMsg = details.map((d: any) => d.description || JSON.stringify(d)).join('; ');
+                }
+                throw new UserError(`Invalid request sent to Google Docs API. Details: ${detailMsg || error.message}`);
+            }
+            if (error.code === 404) throw new UserError(`Document not found (ID: ${documentId}). Check the ID.`);
+            if (error.code === 403) throw new UserError(`Permission denied for document (ID: ${documentId}). Ensure the authenticated user has edit access.`);
+            // Rethrow for retry logic to handle (429, 500, 503 will be retried)
+            throw error;
         }
-        if (error.code === 404) throw new UserError(`Document not found (ID: ${documentId}). Check the ID.`);
-        if (error.code === 403) throw new UserError(`Permission denied for document (ID: ${documentId}). Ensure the authenticated user has edit access.`);
-        // Generic internal error for others
-        throw new Error(`Google API Error (${error.code}): ${error.message}`);
-    }
+    }, `batchUpdate(${documentId.slice(0, 8)}…)`);
 
 }
 
@@ -180,13 +262,10 @@ export async function executeBatchUpdateChunked(
 export async function findTextRange(docs: Docs, documentId: string, textToFind: string, instance: number = 1): Promise<{ startIndex: number; endIndex: number } | null> {
 try {
     // Request more detailed information about the document structure
-    const res = await docs.documents.get({
-        documentId,
-        // Request more fields to handle various container types (not just paragraphs)
-        fields: 'body(content(paragraph(elements(startIndex,endIndex,textRun(content))),table,sectionBreak,tableOfContents,startIndex,endIndex))',
-    });
+    const data = await getDocumentWithRetry(docs, documentId,
+        'body(content(paragraph(elements(startIndex,endIndex,textRun(content))),table,sectionBreak,tableOfContents,startIndex,endIndex))');
 
-    if (!res.data.body?.content) {
+    if (!data.body?.content) {
         console.warn(`No content found in document ${documentId}`);
         return null;
     }
@@ -230,7 +309,7 @@ try {
         });
     };
 
-    collectTextFromContent(res.data.body.content);
+    collectTextFromContent(data.body.content);
 
     // Sort segments by starting position to ensure correct ordering
     segments.sort((a, b) => a.start - b.start);
@@ -315,13 +394,10 @@ try {
     console.log(`Finding paragraph containing index ${indexWithin} in document ${documentId}`);
 
     // Request more detailed document structure to handle nested elements
-    const res = await docs.documents.get({
-        documentId,
-        // Request more comprehensive structure information
-        fields: 'body(content(startIndex,endIndex,paragraph,table,sectionBreak,tableOfContents))',
-    });
+    const data = await getDocumentWithRetry(docs, documentId,
+        'body(content(startIndex,endIndex,paragraph,table,sectionBreak,tableOfContents))');
 
-    if (!res.data.body?.content) {
+    if (!data.body?.content) {
         console.warn(`No content found in document ${documentId}`);
         return null;
     }
@@ -368,7 +444,7 @@ try {
         return null;
     };
 
-    const paragraphRange = findParagraphInContent(res.data.body.content);
+    const paragraphRange = findParagraphInContent(data.body.content);
 
     if (!paragraphRange) {
         console.warn(`Could not find paragraph containing index ${indexWithin}`);
@@ -643,12 +719,7 @@ export async function insertInlineImage(
         insertInlineImage: {
             location: { index },
             uri: imageUrl,
-            ...(width && height && {
-                objectSize: {
-                    height: { magnitude: height, unit: 'PT' },
-                    width: { magnitude: width, unit: 'PT' }
-                }
-            })
+            ...buildObjectSize(width, height)
         }
     };
 

@@ -683,6 +683,42 @@ try {
 }
 });
 
+server.addTool({
+name: 'replaceText',
+description: 'Find and replace text in a document. Replaces ALL occurrences of the search text. Does NOT require knowing text indices — works by content matching. Case-sensitive by default. Use this instead of deleteRange+insertText when you need to update existing text.',
+parameters: DocumentIdParameter.extend({
+  searchText: z.string().min(1).describe('The text to find (exact match).'),
+  replaceText: z.string().describe('The replacement text (can be empty string to delete matches).'),
+  matchCase: z.boolean().optional().default(true).describe('Whether to match case (default: true).'),
+}),
+execute: async (args, { log }) => {
+  const docs = await getDocsClient();
+  log.info(`Replacing "${args.searchText}" with "${args.replaceText}" in doc ${args.documentId}`);
+  try {
+    const request: docs_v1.Schema$Request = {
+      replaceAllText: {
+        containsText: {
+          text: args.searchText,
+          matchCase: args.matchCase,
+        },
+        replaceText: args.replaceText,
+      },
+    };
+    const result = await GDocsHelpers.executeBatchUpdate(docs, args.documentId, [request]);
+    const count = result.replies?.[0]?.replaceAllText?.occurrencesChanged ?? 0;
+    if (count === 0) {
+      return `No occurrences of "${args.searchText}" found in the document.`;
+    }
+    return `Replaced ${count} occurrence(s) of "${args.searchText}" with "${args.replaceText}".`;
+  } catch (error: any) {
+    log.error(`Error replacing text: ${error.message || error}`);
+    if (error instanceof UserError) throw error;
+    if (error.code === 404) throw new UserError(`Document not found (ID: ${args.documentId}).`);
+    throw new UserError(`Failed to replace text: ${error.message || 'Unknown error'}`);
+  }
+}
+});
+
 // --- Markdown Table Fill Helper ---
 
 /**
@@ -1420,6 +1456,74 @@ execute: async (args, { log }) => {
     if (error instanceof UserError) throw error;
     if (error.code === 404) throw new UserError(`Document not found (ID: ${args.documentId}).`);
     throw new UserError(`Failed to add table row: ${error.message || 'Unknown error'}`);
+  }
+}
+});
+
+server.addTool({
+name: 'updateTableCellStyle',
+description: 'Updates visual style of table cells: padding (margins), vertical alignment, background color. Can target specific cells or the entire table. Use padding 0 to make images fill the cell edge-to-edge.',
+parameters: DocumentIdParameter.extend({
+  tableIndex: z.number().int().min(0).describe('The table index (0-based).'),
+  paddingTop: z.number().min(0).optional().describe('Top padding in points (0 = no padding).'),
+  paddingBottom: z.number().min(0).optional().describe('Bottom padding in points.'),
+  paddingLeft: z.number().min(0).optional().describe('Left padding in points.'),
+  paddingRight: z.number().min(0).optional().describe('Right padding in points.'),
+  padding: z.number().min(0).optional().describe('Shorthand: sets all four paddings to this value (individual values override).'),
+  contentAlignment: z.enum(['TOP', 'MIDDLE', 'BOTTOM']).optional().describe('Vertical alignment of cell content.'),
+  backgroundColor: z.object({
+    red: z.number().min(0).max(1).optional(),
+    green: z.number().min(0).max(1).optional(),
+    blue: z.number().min(0).max(1).optional(),
+  }).optional().describe('Cell background color (RGB, 0-1 range).'),
+  startRow: z.number().int().min(0).optional().describe('First row to style (0-based). Omit to style all rows.'),
+  rowSpan: z.number().int().min(1).optional().describe('Number of rows to style. Omit to style from startRow to end.'),
+  startCol: z.number().int().min(0).optional().describe('First column to style (0-based). Omit to style all columns.'),
+  colSpan: z.number().int().min(1).optional().describe('Number of columns to style. Omit to style from startCol to end.'),
+}),
+execute: async (args, { log }) => {
+  const docs = await getDocsClient();
+  log.info(`Updating cell style in table ${args.tableIndex}, doc ${args.documentId}`);
+  try {
+    const res = await docs.documents.get({ documentId: args.documentId });
+    if (!res.data.body?.content) {
+      throw new UserError('Document has no content.');
+    }
+
+    // Build style from args, applying padding shorthand
+    const style: TableHelpers.CellStyleUpdate = {};
+    if (args.padding != null) {
+      style.paddingTop = args.padding;
+      style.paddingBottom = args.padding;
+      style.paddingLeft = args.padding;
+      style.paddingRight = args.padding;
+    }
+    if (args.paddingTop != null) style.paddingTop = args.paddingTop;
+    if (args.paddingBottom != null) style.paddingBottom = args.paddingBottom;
+    if (args.paddingLeft != null) style.paddingLeft = args.paddingLeft;
+    if (args.paddingRight != null) style.paddingRight = args.paddingRight;
+    if (args.contentAlignment) style.contentAlignment = args.contentAlignment;
+    if (args.backgroundColor) style.backgroundColor = args.backgroundColor;
+
+    const requests = TableHelpers.buildUpdateTableCellStyleRequests(
+      res.data.body.content,
+      args.tableIndex,
+      style,
+      args.startRow != null ? { startRow: args.startRow, rowSpan: args.rowSpan } : undefined,
+      args.startCol != null ? { startCol: args.startCol, colSpan: args.colSpan } : undefined,
+    );
+
+    await GDocsHelpers.executeBatchUpdate(docs, args.documentId, requests);
+
+    const rangeDesc = args.startRow != null || args.startCol != null
+      ? `a specified range of cells starting at row ${args.startRow ?? 0} and column ${args.startCol ?? 0}`
+      : 'all cells';
+    return `Successfully updated cell style for ${rangeDesc} in table ${args.tableIndex}.`;
+  } catch (error: any) {
+    log.error(`Error updating table cell style: ${error.message || error}`);
+    if (error instanceof UserError) throw error;
+    if (error.code === 404) throw new UserError(`Document not found (ID: ${args.documentId}).`);
+    throw new UserError(`Failed to update table cell style: ${error.message || 'Unknown error'}`);
   }
 }
 });

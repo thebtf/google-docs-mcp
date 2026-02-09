@@ -3,7 +3,7 @@
 import { docs_v1 } from 'googleapis';
 import { UserError } from 'fastmcp';
 import { TextStyleArgs } from './types.js';
-import { buildUpdateTextStyleRequest } from './googleDocsApiHelpers.js';
+import { buildUpdateTextStyleRequest, buildObjectSize } from './googleDocsApiHelpers.js';
 
 // --- Types ---
 
@@ -357,12 +357,7 @@ export function buildInsertImageInCellRequest(
     insertInlineImage: {
       location: { index: insertPoint },
       uri: imageUrl,
-      ...(width && height && {
-        objectSize: {
-          height: { magnitude: height, unit: 'PT' },
-          width: { magnitude: width, unit: 'PT' },
-        },
-      }),
+      ...buildObjectSize(width, height),
     },
   };
 
@@ -506,12 +501,7 @@ export function buildBatchInsertImageRequests(
       insertInlineImage: {
         location: { index: insertPoint, ...(tabId && { tabId }) },
         uri: img.imageUrl,
-        ...(img.width != null && img.height != null && {
-          objectSize: {
-            height: { magnitude: img.height, unit: 'PT' },
-            width: { magnitude: img.width, unit: 'PT' },
-          },
-        }),
+        ...buildObjectSize(img.width, img.height),
       },
     };
 
@@ -768,4 +758,91 @@ export function readTableCellsFormatted(
   }
 
   return { tableIndex, rows, columns, cells };
+}
+
+// --- Table Cell Style ---
+
+export interface CellStyleUpdate {
+  paddingTop?: number;
+  paddingBottom?: number;
+  paddingLeft?: number;
+  paddingRight?: number;
+  contentAlignment?: 'TOP' | 'MIDDLE' | 'BOTTOM';
+  backgroundColor?: { red?: number; green?: number; blue?: number };
+}
+
+/**
+ * Build updateTableCellStyle requests for a range of cells.
+ * If no row/col range is specified, applies to the entire table.
+ */
+export function buildUpdateTableCellStyleRequests(
+  bodyContent: docs_v1.Schema$StructuralElement[],
+  tableIndex: number,
+  style: CellStyleUpdate,
+  rowRange?: { startRow: number; rowSpan?: number },
+  colRange?: { startCol: number; colSpan?: number },
+): docs_v1.Schema$Request[] {
+  const tableEl = getTableElement(bodyContent, tableIndex);
+  const table = tableEl.table!;
+  const tableStartIndex = tableEl.startIndex ?? 0;
+
+  const totalRows = table.rows ?? 0;
+  const totalCols = table.columns ?? 0;
+
+  const startRow = rowRange?.startRow ?? 0;
+  const rowSpan = rowRange?.rowSpan ?? totalRows - startRow;
+  const startCol = colRange?.startCol ?? 0;
+  const colSpan = colRange?.colSpan ?? totalCols - startCol;
+
+  // Build tableCellStyle object
+  const tableCellStyle: any = {};
+  const fields: string[] = [];
+
+  if (style.paddingTop != null) {
+    tableCellStyle.paddingTop = { magnitude: style.paddingTop, unit: 'PT' };
+    fields.push('paddingTop');
+  }
+  if (style.paddingBottom != null) {
+    tableCellStyle.paddingBottom = { magnitude: style.paddingBottom, unit: 'PT' };
+    fields.push('paddingBottom');
+  }
+  if (style.paddingLeft != null) {
+    tableCellStyle.paddingLeft = { magnitude: style.paddingLeft, unit: 'PT' };
+    fields.push('paddingLeft');
+  }
+  if (style.paddingRight != null) {
+    tableCellStyle.paddingRight = { magnitude: style.paddingRight, unit: 'PT' };
+    fields.push('paddingRight');
+  }
+  if (style.contentAlignment != null) {
+    tableCellStyle.contentAlignment = style.contentAlignment;
+    fields.push('contentAlignment');
+  }
+  if (style.backgroundColor != null) {
+    tableCellStyle.backgroundColor = { color: { rgbColor: style.backgroundColor } };
+    fields.push('backgroundColor');
+  }
+
+  if (fields.length === 0) {
+    throw new UserError('No style properties specified.');
+  }
+
+  // Build one request for the entire cell block.
+  const request: docs_v1.Schema$Request = {
+    updateTableCellStyle: {
+      tableCellStyle,
+      tableRange: {
+        tableCellLocation: {
+          tableStartLocation: { index: tableStartIndex },
+          rowIndex: startRow,
+          columnIndex: startCol,
+        },
+        rowSpan: rowSpan,
+        columnSpan: colSpan,
+      },
+      fields: fields.join(','),
+    },
+  };
+
+  return [request];
 }
