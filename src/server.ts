@@ -1516,7 +1516,7 @@ execute: async (args, { log }) => {
     await GDocsHelpers.executeBatchUpdate(docs, args.documentId, requests);
 
     const rangeDesc = args.startRow != null || args.startCol != null
-      ? `rows ${args.startRow ?? 0}-${(args.startRow ?? 0) + (args.rowSpan ?? 999)}, cols ${args.startCol ?? 0}-${(args.startCol ?? 0) + (args.colSpan ?? 999)}`
+      ? `a specified range of cells starting at row ${args.startRow ?? 0} and column ${args.startCol ?? 0}`
       : 'all cells';
     return `Successfully updated cell style for ${rangeDesc} in table ${args.tableIndex}.`;
   } catch (error: any) {

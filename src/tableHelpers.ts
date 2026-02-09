@@ -827,26 +827,22 @@ export function buildUpdateTableCellStyleRequests(
     throw new UserError('No style properties specified.');
   }
 
-  // Build one request per row-chunk (Google API applies to a row-range of cells)
-  const requests: docs_v1.Schema$Request[] = [];
-
-  for (let r = startRow; r < startRow + rowSpan; r++) {
-    requests.push({
-      updateTableCellStyle: {
-        tableCellStyle,
-        tableRange: {
-          tableCellLocation: {
-            tableStartLocation: { index: tableStartIndex },
-            rowIndex: r,
-            columnIndex: startCol,
-          },
-          rowSpan: 1,
-          columnSpan: colSpan,
+  // Build one request for the entire cell block.
+  const request: docs_v1.Schema$Request = {
+    updateTableCellStyle: {
+      tableCellStyle,
+      tableRange: {
+        tableCellLocation: {
+          tableStartLocation: { index: tableStartIndex },
+          rowIndex: startRow,
+          columnIndex: startCol,
         },
-        fields: fields.join(','),
+        rowSpan: rowSpan,
+        columnSpan: colSpan,
       },
-    });
-  }
+      fields: fields.join(','),
+    },
+  };
 
-  return requests;
+  return [request];
 }

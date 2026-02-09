@@ -45,10 +45,16 @@ async function retryWithBackoff<T>(
             return await fn();
         } catch (error: any) {
             lastError = error;
+            if (attempt === RETRY_MAX_ATTEMPTS) {
+                // Last attempt failed, break out of the loop to throw.
+                break;
+            }
+
             const httpCode = error.code ?? error.response?.status;
             const isHttpTransient = httpCode === 429 || httpCode === 500 || httpCode === 503;
             const isNetworkTransient = typeof error.code === 'string' && RETRYABLE_NETWORK_CODES.has(error.code);
-            if (attempt < RETRY_MAX_ATTEMPTS && (isHttpTransient || isNetworkTransient)) {
+
+            if (isHttpTransient || isNetworkTransient) {
                 const retryAfterHeader = error.response?.headers?.['retry-after'];
                 const retryAfterMs = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : 0;
                 const exponentialDelay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
@@ -60,12 +66,13 @@ async function retryWithBackoff<T>(
                 const reason = isNetworkTransient ? error.code : `HTTP ${httpCode}`;
                 console.warn(
                     `[${label}] ${reason}, retrying in ${Math.round(delay)}ms ` +
-                    `(attempt ${attempt + 1}/${RETRY_MAX_ATTEMPTS})`,
+                    `(retry ${attempt + 1} of ${RETRY_MAX_ATTEMPTS})`,
                 );
                 await new Promise(resolve => setTimeout(resolve, delay));
-                continue;
+            } else {
+                // Not a retryable error, throw immediately.
+                throw error;
             }
-            throw error;
         }
     }
     throw lastError;
